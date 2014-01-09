@@ -79,6 +79,13 @@ proton_opts = [
                default='',
                help='Name for the AMQP container'),
 
+    # @todo: other options?
+
+    # for now:
+    cfg.BoolOpt('amqp10_point_to_point',
+                default=False,
+                help='Enable point-to-point messaging.')
+
     cfg.BoolOpt('proton_trace',
                 default=False,
                 help='Enable protocol tracing')
@@ -87,83 +94,91 @@ proton_opts = [
 JSON_CONTENT_TYPE = 'application/json; charset=utf8'
 
 
-
-class _ProtonDaemon(threading.Thread):
-    """Manages a thread running an instance of the QPID Proton protocol engine.
+class _SocketConnection(proton_wrapper.ConnectionEventHandler):
+    """Associates a proton Connection with a python network socket, 
+    and handles all connection-related events.
     """
 
-    class Empty(Exception):
-        """Exception raised by self.fetch() when there is no message available
-        within the alloted time.
+    def __init__(self, name, socket, container, proton_lock,
+                 properties):
+        self.name = name
+        self.socket = socket
+        self._proton_lock = proton_lock
+        self._properties = properties
+
+        with proton_lock:
+            self.connection = container.create_connection(name, self,
+                                                          properties)
+            self.connection.user_context = self
+
+    def fileno(self):
+        """Allows use of a _SocketConnection in a select() call.
         """
-        pass
+        return self.socket.fileno()
 
-    class Timeout(Exception):
-        """Exception raised by self.send() when the send does not complete
-        within the alloted time.
-        """
-        pass
+    def process_input(self):
+        """Called when socket is read-ready"""
+        try:
+            rc = fusion.read_socket_input(self.connection,
+                                          self.socket)
+        except:
+            rc = Connection.EOS
+        if rc > 0:
+            self.connection.process(time.time())
+        return rc
 
-    class SendRequest(object):
-        """A request to send a single message.
-        """
-        def __init__(self, msg):
-            self.msg = msg
-            self._done = threading.Event()
-            self.aborted = False
+    def send_output(self):
+        """Called when socket is write-ready"""
+        try:
+            rc = fusion.write_socket_output(self.connection,
+                                            self.socket)
+        except:
+            rc = Connection.EOS
+        if rc > 0:
+            self.connection.process(time.time())
+        return rc
 
-        def wait(self, timeout=None):
-            """Wait for send to complete.  Return True if send completed, else
-            False if timeout.
-            """
-            return self._done.wait(timeout)
+    # ConnectionEventHandler callbacks
+    # Note well: all of these callbacks are invoked while the proton_lock is held
 
-        def sent(self):
-            self._done.set()
+    def connection_active(self, connection):
+        print "APP: CONN ACTIVE"
 
-        def abort(self):
-            """Signal that the send request failed due to thread
-            shutdown.
-            """
-            self.aborted = True
-            self._done.set()
+    def connection_closed(self, connection, reason):
+        print "APP: CONN CLOSED"
 
-    class SubscribeRequest(object):
-        """A request to subscribe to a given source of messages.
-        """
-        def __init__(self, source_address):
-            self.source_address = source_address
-            self._done = threading.Event()
-            self.handle = None
+    def sender_requested(self, connection, link_handle,
+                         requested_source, properties):
+        ## @todo: support needed for peer-2-peer
+        print "APP: SENDER LINK REQUESTED"
 
-        def wait(self, timeout=None):
-            """Wait for subscription request to complete. Returns True when
-            subscription completed, else False if timed-out.
-            """
-            return self._done.wait(timeout)
+    def receiver_requested(self, connection, link_handle,
+                           requested_target, properties):
+        ## @todo: support needed for peer-2-peer
+        print "APP: RECEIVER LINK REQUESTED"
 
-        def subscribed(self, subscription_id):
-            """Signal that the subscription request completed.  The
-            subscription_id identifies the new subscription, which can be used
-            to cancel it in the future.
-            """
-            self.handle = subscription_id
-            self._done.set()
+    # SASL callbacks:
 
-        def aborted(self):
-            """Signal that the subscription request failed due to thread
-            shutdown.
-            """
-            self.handle = None
-            self._done.set()
+    def sasl_step(self, connection, pn_sasl):
+        print "SASL STEP"
 
-    def __init__(self, conf):
-        """Create a _ProtonDaemon.
-        """
+    def sasl_done(self, connection, result):
+        print "APP: SASL DONE"
+        print result
+
+
+
+class ProtonDriver(base.BaseDriver, threading.Thread):
+
+    def __init__(self, conf, url,
+                 default_exchange=None, allowed_remote_exmods=[]):
+        if not proton:
+            raise ImportError("Failed to import Qpid Proton library")
+
         threading.Thread.__init__(self)
-        self._conf = conf
-
-        self._wakeup_pipe = os.Pipe() # (r,w)
+        base.BaseDriver.__init__(self, conf, url, default_exchange,
+                                 allowed_remote_exmods)
+        self.conf.register_opts(proton_opts)
 
         # pending outgoing messages (SendRequest)
         self._send_requests = moves.queue.Queue()
@@ -177,190 +192,201 @@ class _ProtonDaemon(threading.Thread):
         #
         # Configure a container
         #
-        container_name = self._conf.amqp10_container_name
+        container_name = self.conf.amqp10_container_name
         if container_name:
             self._container = proton_wrapper.Container(container_name)
         else:
             self._container = proton_wrapper.Container(uuid.uuid4().hex)
 
-        self.daemon = True
+
+
+        # run the Proton Engine event/timer thread:
+
+        self._wakeup_pipe = os.Pipe() # (r,w) - to force return from select()
+        self._proton_lock = threading.Lock()
+
         self.name = "Thread for Proton container: %s" % self._container.name
-        self._done = False
-        LOG.debug(_("Starting Proton container %s") % self._container.name))
+        self._shutdown = False
+        self.daemon = False # KAG: or True ???
         self.start()
 
     def wakeup(self):
-        """Force the select() to return"""
+        """Force the Proton thread to wake up"""
         os.write(self._wakeup_pipe[1], "!")
 
     def destroy(self):
         """Stop the Proton thread, releasing all resources.
         """
         LOG.debug("Stopping Proton container %s" % self._container.name)
-        self._done = True
+        self._shutdown = True
         self.wakeup()
         self.join()
 
-    def send(self, msg, timeout=None):
-        """Enqueue msg for eventual transmit.
-        """
-        LOG.debug("sending msg %s" % str(msg))
-        req = MessengerDaemon._SendRequest(msg)
-        self._client_requests_lock.acquire()
-        try:
-            if self._subscribe_requests is None:
-                # Messenger thread has shutdown
-                raise MessengerDaemon.Timeout()
-            self._send_requests.append(req)
-        finally:
-            self._client_requests_lock.release()
-        self._messenger.interrupt()
-        # @todo Need some way of aborting wait if Messenger thread exits!
-        if not req.wait(timeout):
-            raise MessengerDaemon.Timeout()
-        LOG.debug("sent msg %s" % str(msg))
+    def get_connection(self, url, properties={}):
+        """Get a _SocketConnection to a peer represented by url"""
+        # @todo KAG: for now, assume amqp://<hostname>[:port]
+        regex = re.compile(r"^amqp://([a-zA-Z0-9.]+)(:([\d]+))?$")
+        x = regex.match(url)
+        if not x:
+            error = "Bad URL syntax: %s" % url
+            LOG.warn(_(error))
+            raise Exception(error)
 
-    def subscribe(self, source_address):
-        """Subscribe to source address. Causes messages to arrive from the
-        source_address. Returns handle which is used to unsubscribe.
-        """
-        req = MessengerDaemon._SubscribeRequest(source_address)
-        self._client_requests_lock.acquire()
-        try:
-            if self._subscribe_requests is None:
-                # Messenger thread has shutdown
-                return None
-            self._subscribe_requests.append(req)
-        finally:
-            self._client_requests_lock.release()
-        self._messenger.interrupt()
-        # @TODO(kgiusti) Need some way of aborting wait if Messenger thread
-        # exits!
-        req.wait()
-        LOG.debug("subscribed to %s" % str(source_address))
-        return req.handle
+        # return pre-existing
+        with self._proton_lock:
+            conn = self._container.get_connection(url)
+        if conn:
+            assert isinstance(conn.user_context, _SocketConnection)
+            return conn.user_context
 
-    def unsubscribe(self, handle):
-        """Cancel a subscription.  Any pending messages will be discarded.
-        Handle was returned by the subscribe() method.
-        """
-        # @TODO(kgiusti): currently Messenger cannot unsubscribe, see
-        # https://issues.apache.org/jira/browse/PROTON-142
-        LOG.debug("unsubscribed %s (%s)" % handle)
-
-    def fetch(self, timeout=None):
-        """Retrieve the next available received message, block until a message
-        is available or timeout expires. Throws Empty if no message retrieved.
-        """
+        # create new connection
+        matches = x.groups()
+        host = matches[0]
+        port = int(matches[2]) if matches[2] else None
+        addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        if not addr:
+            error = "Could not translate address '%s'" % url
+            LOG.warn(_(error))
+            raise Exception(error)
+        my_socket = socket.socket(addr[0][0], addr[0][1], addr[0][2])
+        my_socket.setblocking(0) # 0=non-blocking
         try:
-            return self._received_msgs.get(True, timeout)
-        except Queue.Empty:
-            raise MessengerDaemon.Empty()
+            my_socket.connect(addr[0][4])
+        except socket.error, e:
+            if e[0] != errno.EINPROGRESS:
+                error = "Socket connect failure '%s'" % str(e)
+                LOG.warn(_(error))
+                raise Exception(error)
+
+        # create a new connection - this will be stored in the container,
+        # using the url as the lookup key
+        sc = _SocketConnection(url, my_socket,
+                               self._container,
+                               self._proton_lock,
+                               properties)
+        if self.conf.amqp10_sasl_mechanisms:
+                pn_sasl = sc.connection.sasl
+                pn_sasl.mechanisms(self.conf.amqp10_sasl_mechanisms)
+                # @todo KAG: server if accepting inbound connections
+                pn_sasl.client()
+        return sc
+
 
     def run(self):
-        """Thread body."""
-        available_credit = 0
-        self._messenger.start()
-        while not self._done:
+        """Proton event/timer thread"""
 
-            subs = []
-            sends = []
+        LOG.debug(_("Starting Proton thread container=%s") % self._container.name))
 
-            # Gather all pending requests
-            self._client_requests_lock.acquire()
-            try:
-                subs = self._subscribe_requests
-                self._subscribe_requests = []
-                sends = self._send_requests
-                self._send_requests = []
-            finally:
-                self._client_requests_lock.release()
+        while not self._shutdown:
 
-            # Create all requested subscriptions
-            for req in subs:
-                addr = self._url_prefix + req.source_address
-                self._messenger.subscribe(addr)
-                LOG.debug(_("subscribed to '%s'") % addr)
-                req.subscribed(addr)
-                available_credit += 10
+            readfd = [self._wakeup_pipe[0]]
+            writefd = []
 
-            # Send all outbound messages
-            sent = 0
-            for req in sends:
-                self._messenger.put(req.msg)
-                # @todo - do not complete the request until the message has
-                # reached a terminal state (ie, monitor the tracker).
-                # For now, the send is unreliable
-                #self._messenger.send()
-                req.sent()
-                sent += 1
+            with self._proton_lock:
+                readers,writers,timers = container.need_processing()
 
-            # Process all received messages
-            while self._messenger.incoming > 0:
-                msg = qpid_proton.Message()
-                self._messenger.get(msg)
-                #available_credit += 1
-                self._received_msgs.put(msg)
+            # map fusion Connections back to my SocketConnections
+            for c in readers:
+                sc = c.user_context
+                assert sc and isinstance(sc, _SocketConnection)
+                readfd.append(sc)
+            for c in writers:
+                sc = c.user_context
+                assert sc and isinstance(sc, _SocketConnection)
+                writefd.append(sc)
 
-            # do protocol processing
-            try:
-                # @TODO(kgiusti): can't grant credit without recv(), can't call
-                # recv() without setting up subscriptions.  Awkward.
-                if available_credit > 0:
-                    #c = available_credit
-                    #available_credit = 0
-                    #print("M: granting credit = %d" % c)
-                    #self._messenger.recv(c)
-                    self._messenger.recv(available_credit)
-                else:
-                    self._messenger.work()
-            except qpid_proton.Interrupt:
+            timeout = None
+            if timers:
+                deadline = timers[0].next_tick # 0 == next expiring timer
+                now = time.time()
+                timeout = 0 if deadline <= now else deadline - now
+
+            LOG.debug(_("proton thread select() call (timeout=%s)" % str(timeout)))
+            readable,writable,ignore = select.select(readfd,writefd,[],timeout)
+            LOG.debug(_("select() returned"))
+
+            while os.read(self._wakeup_pipe[0], 512):
                 pass
 
-        LOG.debug(_("Messenger thread stopping..."))
+            for r in readable:
+                if r is self._wakeup_pipe[0]: continue
+                assert isinstance(r, SocketConnection)
+
+                # @todo: KAG update to use utility method
+                with self._proton_lock:
+                    count = r.connection.needs_input
+                    if count > 0:
+                        try:
+                            sock_data = r.socket.recv(count)
+                            if sock_data:
+                                r.connection.process_input( sock_data )
+                            else:
+                                # closed?
+                                r.connection.close_input()
+                        except socket.timeout, e:
+                            # I don't expect this
+                            LOG.warn(_("Unexpected socket timeout %s" % str(e)))
+                        except socket.error, e:
+                            err = e.args[0]
+                            # ignore non-fatal errors
+                            if (err != errno.EAGAIN and
+                                err != errno.EWOULDBLOCK and
+                                err != errno.EINTR):
+                                # otherwise, unrecoverable:
+                                r.connection.close_input()
+                                LOG.warn(_("Unexpected socket error %s" % str(e)))
+                        except Exception, e:  # beats me...
+                            r.connection.close_input()
+                            LOG.warn(_("Unknown socket error" % str(e)))
+
+                        r.connection.process(time.time())
+
+            for t in timers:
+                if t.next_tick > time.time():
+                    break
+                with self._proton_lock:
+                    t.process(time.time())
+
+            for w in writable:
+                # @todo: KAG update to use utility method
+                assert isinstance(w, SocketConnection)
+                with self._proton_lock:
+                    data = w.connection.output_data()
+                    if data:
+                        try:
+                            rc = w.socket.send(data)
+                            if rc > 0:
+                                w.connection.output_written(rc)
+                            else:
+                                # else socket closed
+                                w.connection.close_output()
+                        except socket.timeout, e:
+                            # I don't expect this
+                            LOG.warn(_("Unexpected socket timeout %s" % str(e)))
+                        except socket.error, e:
+                            err = e.args[0]
+                            # ignore non-fatal errors
+                            if (err != errno.EAGAIN and
+                                err != errno.EWOULDBLOCK and
+                                err != errno.EINTR):
+                                # otherwise, unrecoverable
+                                w.connection.close_output()
+                                LOG.warn(_("Unexpected socket error %s" % str(e)))
+                        except Exception, e:  # beats me...
+                            w.connection.close_output()
+                            LOG.warn(_("Unknown socket error %s" % str(e)))
+                        w.connection.process(time.time())
+
+        LOG.debug(_("Stopping Proton thread, container=%s") % self._container.name))
 
         # abort any requests. Setting the lists to None here prevents further
         # requests from being created
 
-        self._client_requests_lock.acquire()
-        try:
-            subs = self._subscribe_requests
-            self._subscribe_requests = None
-            sends = self._send_requests
-            self._send_requests = None
-        finally:
-            self._client_requests_lock.release()
+        print("TODO: clean shutdown")
 
-        for req in subs + sends:
-            req.abort()
-            print("REQ ABORT")
-
-        # flush any pending sends...
-        try:
-            while self._messenger.outgoing > 0:
-                # @TODO(kgiusti) timeout?
-                self._messenger.send()
-        except Exception:
-            LOG.warning(_("Messenger failed to flush outgoing messages"))
-
-        self._messenger.stop()
-        LOG.debug(_("Messenger stopped"))
-
-
-
-class ProtonDriver(base.BaseDriver):
-
-    def __init__(self, conf, url,
-                 default_exchange=None, allowed_remote_exmods=[]):
-        if not proton:
-            raise ImportError("Failed to import Qpid Proton library")
-
-        super(ProtonDriver, self).__init__(conf, url,
-                                           default_exchange,
-                                           allowed_remote_exmods)
-        conf.register_opts(proton_opts)
-        self._daemon = _ProtonDaemon(conf)
-
+    #
+    # BaseDriver Interface:
+    #
     def send(self, target, ctxt, message,
              wait_for_reply=None, timeout=None, envelope=False):
         """Send a message to the given target."""
