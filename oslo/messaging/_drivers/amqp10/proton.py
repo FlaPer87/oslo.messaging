@@ -166,43 +166,36 @@ class _SocketConnection(proton_wrapper.ConnectionEventHandler):
         print "APP: SASL DONE"
         print result
 
+class TaskQueue(Object):
+    def __init__(self):
+        self._wakeup_pipe = os.Pipe()
+        self._tasks = moves.queue.Queue()
+
+    def put(self, task):
+        self._tasks.put(task)
+        os.write(self._wakeup_pipe[1], "!")
 
 
-class ProtonDriver(base.BaseDriver, threading.Thread):
+class ContainerIO(threading.Thread):
 
-    def __init__(self, conf, url,
-                 default_exchange=None, allowed_remote_exmods=[]):
+    def __init__(self, container_name=None):
         if not proton:
             raise ImportError("Failed to import Qpid Proton library")
 
         threading.Thread.__init__(self)
-        base.BaseDriver.__init__(self, conf, url, default_exchange,
-                                 allowed_remote_exmods)
-        self.conf.register_opts(proton_opts)
 
-        # pending outgoing messages (SendRequest)
-        self._send_requests = moves.queue.Queue()
-
-        # pending subscription requests (SubscribeRequest)
-        self._subscribe_requests = moves.queue.Queue()
-
-        # queue of received messages ??? blah
-        self._received_msgs = moves.queue.Queue()
+        # queued tasks from other threads
+        self._tasks = TaskQueue()
 
         #
         # Configure a container
         #
-        container_name = self.conf.amqp10_container_name
         if container_name:
             self._container = proton_wrapper.Container(container_name)
         else:
             self._container = proton_wrapper.Container(uuid.uuid4().hex)
 
-
-
         # run the Proton Engine event/timer thread:
-
-        self._wakeup_pipe = os.Pipe() # (r,w) - to force return from select()
         self._proton_lock = threading.Lock()
 
         self.name = "Thread for Proton container: %s" % self._container.name
@@ -212,7 +205,7 @@ class ProtonDriver(base.BaseDriver, threading.Thread):
 
     def wakeup(self):
         """Force the Proton thread to wake up"""
-        os.write(self._wakeup_pipe[1], "!")
+        os.write(self._tasks.pipe()[1], "!")
 
     def destroy(self):
         """Stop the Proton thread, releasing all resources.
@@ -222,26 +215,16 @@ class ProtonDriver(base.BaseDriver, threading.Thread):
         self.wakeup()
         self.join()
 
-    def get_connection(self, url, properties={}):
+    def connect(self, hostname, port=5672, properties={}, name=None):
         """Get a _SocketConnection to a peer represented by url"""
-        # @todo KAG: for now, assume amqp://<hostname>[:port]
-        regex = re.compile(r"^amqp://([a-zA-Z0-9.]+)(:([\d]+))?$")
-        x = regex.match(url)
-        if not x:
-            error = "Bad URL syntax: %s" % url
-            LOG.warn(_(error))
-            raise Exception(error)
-
+        key = name or "%s:%i" % (host, port)
         # return pre-existing
         with self._proton_lock:
-            conn = self._container.get_connection(url)
+            conn = self._container.get_connection(key)
         if conn:
             assert isinstance(conn.user_context, _SocketConnection)
             return conn.user_context
 
-        # create new connection
-        matches = x.groups()
-        host = matches[0]
         port = int(matches[2]) if matches[2] else None
         addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
         if not addr:
@@ -258,9 +241,10 @@ class ProtonDriver(base.BaseDriver, threading.Thread):
                 LOG.warn(_(error))
                 raise Exception(error)
 
-        # create a new connection - this will be stored in the container,
-        # using the url as the lookup key
-        sc = _SocketConnection(url, my_socket,
+        # create a new connection - this will be stored in the
+        # container, using the specified name as the lookup key, or if
+        # no name was provided, the host:port combination
+        sc = _SocketConnection(key, my_socket,
                                self._container,
                                self._proton_lock,
                                properties)
@@ -279,7 +263,7 @@ class ProtonDriver(base.BaseDriver, threading.Thread):
 
         while not self._shutdown:
 
-            readfd = [self._wakeup_pipe[0]]
+            readfd = [self._tasks.pipe()[0]]
             writefd = []
 
             with self._proton_lock:
@@ -305,11 +289,11 @@ class ProtonDriver(base.BaseDriver, threading.Thread):
             readable,writable,ignore = select.select(readfd,writefd,[],timeout)
             LOG.debug(_("select() returned"))
 
-            while os.read(self._wakeup_pipe[0], 512):
+            while os.read(self._tasks.pipe()[0], 512):
                 pass
 
             for r in readable:
-                if r is self._wakeup_pipe[0]: continue
+                if r is self._tasks.pipe()[0]: continue
                 assert isinstance(r, SocketConnection)
 
                 # @todo: KAG update to use utility method
@@ -384,25 +368,182 @@ class ProtonDriver(base.BaseDriver, threading.Thread):
 
         print("TODO: clean shutdown")
 
-    #
-    # BaseDriver Interface:
-    #
+class Replies(ReceiverEventHandler):
+    def __init__(self, connection)
+        self._correlation = {} # map of correlation-id to response queue
+        self._ready = False
+        self._replies = connection.create_receiver(source_address=address, target_address=address, eventHandler=self)
+        # can't handle a request until the replies link is active, as we need the peer assigned address
+        # TODO need to delay any processing of task queue until this is done
+
+    def prepare_for_response(self, request, reply_queue):
+        assert(self._ready)
+        if reply_queue:
+            request.message_id = uuid.uuid4().hex
+            request.reply_to = self._receiver.source_address
+            self._correlation[request.message_id] = reply_queue
+
+    def receiver_active(self, receiver_link):
+        self._ready = True
+
+    def receiver_remote_closed(self, receiver, error=None):
+        LOG.error("Reply subscription closed by peer: %s" % (error or "no error given"))
+
+    def message_received(self, receiver, message, handle):
+        if message.correlation_id in self._correlation:
+            self._correlation[message.correlation_id].put(message)
+
+class Server(ReceiverEventHandler):
+    def __init__(self, connection, addresses, incoming):
+        self._incoming = incoming
+        for a in addresses:
+            self._receivers.append(connection.create_receiver(source_address=a, target_address=a, eventHandler=self)
+
+    def receiver_remote_closed(self, receiver, error=None):
+        LOG.error("Server subscription %s closed by peer: %s" % (receiver.source_address or receiver.target_address, error or "no error given"))
+
+    def message_received(self, receiver, message, handle):
+        incoming.put(message)
+
+class ProtocolManager(Object):
+    def __init__(self, host, port=5672):
+        self._container_io = ContainerIO()
+        self._connection = _container_io.connect(host, port)
+        self._replies = Replies(self._connection)
+        self._senders = {}
+        self._servers = {}
+
+    def request(self, target, request, reply_queue=None):
+        """ send a request to the given target, and arrange for a
+            response to be put on the optional reply_queue if specified"""
+
+        address = self._resolve(target)
+        self._replies.prepare_for_response(request, reply_queue)
+        self._sender(address).send(request)
+
+    def response(self, address, response):
+        self._sender(address).send(response)
+
+    def subscribe(self, target, request_queue):
+        assert(target.topic)
+        assert(target.server)
+        server_address = self._add_server_prefix("%s.%s" % (target.topic, target.server))
+        broadcast_address = self._add_broadcast_prefix("broadcast.%s" % target.topic)
+        group_address = self._add_group_request_prefix(target.topic)
+        self._servers[target] = Server(self._connection, [server_address, group_address, broadcast_address], request_queue)
+
+    def _resolve(self, target):
+        if target.server:
+            address = self._add_server_prefix("%s.%s" % (target.topic, target.server))
+        else if target.fanout:
+            address = self._add_broadcast_prefix("broadcast.%s" % target.topic)
+        else:
+            address = self._add_group_request_prefix(target.topic)
+        return address
+
+    def _sender(self, address):
+        # if we already have a sender for that address, use it
+        # else establish the sender and cache it
+        if address in self._senders:
+            sender = self._senders[address]
+        else:
+            sender = self._connection.create_sender(source_address=address, target_address=address)
+            self._senders[address] = sender
+        return sender
+
+class Task(object):
+    @abc.abstractmethod
+    def execute(self, manager):
+        """Perform operation on the protocol manager (will be called on a thread of its choosing)"""
+
+
+class SendTask(ProtonTask):
+    def __init__(self, target, request, reply_expected):
+        self._target = target
+        self._request = request
+        if reply_expected:
+            self._reply_queue = moves.queue.Queue()
+
+    def execute(self, manager):
+        manager.request(self._target, self._request, self._reply_queue)
+
+    def get_reply(self, timeout):
+        if not self._reply_queue: return None
+        return self._reply_queue.get(timeout);
+
+class ListenTask(ProtonTask):
+    def __init__(self, target, request_queue):
+        self._target = target
+        self._request_queue = _request_queue
+
+    def execute(self, manager):
+        manager.subscribe(self._target, self._request_queue)
+
+class ReplyTask(ProtonTask):
+    def __init__(self, address, response, log_failure):
+        self._address = address
+        self._response = response
+        self._log_failure = log_failure
+
+    def execute(self, manager):
+        manager.reply(self._address, self._response)
+
+
+class ProtonIncomingMessage(base.IncomingMessage):
+    def __init__(self, listener, ctxt, message, task_queue):
+        base.IncomingMessage.__init__(listener, ctxt, message)
+        self._task_queue = task_queue
+        self._reply_to = message.reply_to
+
+    def reply(self, reply=None, failure=None, log_failure=True):
+        if reply:
+            response = marshal_reply(reply)
+        else if failure:
+            response = marshal_failure(failure)
+        else:
+            return
+        self._task_queue.put(ReplyTask(self._reply_to, response, log_failure))
+
+class ProtonListenerImpl(base.Listener):
+    def __init__(self, driver, target):
+        base.Listener.__init__(self, driver, target, task_queue)
+        self._task_queue = task_queue
+        self._incoming = moves.queue.Queue()
+
+    def poll(self):
+        request, ctxt = unmarshal_request(self._incoming.get())
+        return ProtonIncomingMessage(self, ctxt, request, self._task_queue)
+
+    def incoming():
+        return self._incoming
+
+class ProtonDriverImpl(base.BaseDriver):
+
+    def __init__(self, conf, url,
+                 default_exchange=None, allowed_remote_exmods=[]):
+
+        base.BaseDriver.__init__(self, conf, url, default_exchange,
+                                 allowed_remote_exmods)
+
     def send(self, target, ctxt, message,
              wait_for_reply=None, timeout=None, envelope=False):
         """Send a message to the given target."""
-        assert False, "NOT YET IMPLEMENTED"
+        request = marshal_request(message, ctxt, envelope, timeout)
+        task = SendTask(target, request, wait_for_reply)
+        self._tasks.put(task)
+        reply = task.get_reply()
+        if reply:
+            unmarshal_response(reply)
 
     def send_notification(self, target, ctxt, message, version):
         """Send a notification message to the given target."""
-        assert False, "NOT YET IMPLEMENTED"
 
     def listen(self, target):
         """Construct a Listener for the given target."""
-        assert False, "NOT YET IMPLEMENTED"
+        listener = ProtonListenerImpl(self, target, self.tasks)
+        self._tasks.put(ListenTask(target, listener._incoming))
+        return listener
 
     def cleanup(self):
         """Release all resources."""
-        assert False, "NOT YET IMPLEMENTED"
-        self._daemon.destroy()
-
-
+        self._protocol_mgr.destroy()
