@@ -96,24 +96,22 @@ class _SocketConnection(proton_wrapper.ConnectionEventHandler):
     and handles all connection-related events.
     """
 
-    def __init__(self, name, socket, container, proton_lock,
-                 properties):
+    def __init__(self, name, socket, container,
+                 properties, handler=None):
         self.name = name
         self.socket = socket
-        self._proton_lock = proton_lock
         self._properties = properties
-
-        with proton_lock:
-            self.connection = container.create_connection(name, self,
-                                                          properties)
-            self.connection.user_context = self
+        self.connection = container.create_connection(name,
+                                                      handler or self,
+                                                      properties)
+        self.connection.user_context = self
 
     def fileno(self):
         """Allows use of a _SocketConnection in a select() call.
         """
         return self.socket.fileno()
 
-    def process_input(self):
+    def read(self):
         """Called when socket is read-ready."""
         try:
             rc = proton_wrapper.sockets.read_socket_input(self.connection,
@@ -124,7 +122,7 @@ class _SocketConnection(proton_wrapper.ConnectionEventHandler):
             self.connection.process(time.time())
         return rc
 
-    def send_output(self):
+    def write(self):
         """Called when socket is write-ready."""
         try:
             rc = proton_wrapper.sockets.write_socket_output(self.connection,
@@ -136,8 +134,6 @@ class _SocketConnection(proton_wrapper.ConnectionEventHandler):
         return rc
 
     # ConnectionEventHandler callbacks
-    # Note well: these callbacks are all invoked while the proton_lock is held
-
     def connection_active(self, connection):
         LOG.info("APP: CONN ACTIVE")
 
@@ -163,61 +159,64 @@ class _SocketConnection(proton_wrapper.ConnectionEventHandler):
         LOG.info("APP: SASL DONE: %s" % result)
 
 
-class TaskQueue(object):
+class Requests(object):
     def __init__(self):
-        self._wakeup_pipe = os.Pipe()
-        self._tasks = moves.queue.Queue()
+        self._requests = moves.queue.Queue()
+        self._wakeup_pipe = os.pipe()
 
-    def put(self, task):
-        self._tasks.put(task)
+    def wakeup(self, request=None):
+        if request:
+            self._requests.put(request)
         os.write(self._wakeup_pipe[1], "!")
 
+    def fileno(self):
+        return self._wakeup_pipe[0]
 
-class ContainerIO(threading.Thread):
+    def read(self):
+        os.read(self._wakeup_pipe[0], 512)
+        while not self._requests.empty():
+            self._requests.get()()
+
+
+class ProcessingThread(threading.Thread):
 
     def __init__(self, container_name=None):
-        if not proton:
-            raise ImportError("Failed to import Qpid Proton library")
-
         threading.Thread.__init__(self)
 
-        # queued tasks from other threads
-        self._tasks = TaskQueue()
+        # handle requests from other threads
+        self._requests = Requests()
 
-        #
         # Configure a container
-        #
         if container_name:
             self._container = proton_wrapper.Container(container_name)
         else:
             self._container = proton_wrapper.Container(uuid.uuid4().hex)
 
-        # run the Proton Engine event/timer thread:
-        self._proton_lock = threading.Lock()
-
         self.name = "Thread for Proton container: %s" % self._container.name
         self._shutdown = False
-        self.daemon = False  # KAG: or True ???
+        self.daemon = True
         self.start()
 
-    def wakeup(self):
-        """Force the Proton thread to wake up."""
-        os.write(self._tasks.pipe()[1], "!")
+    def wakeup(self, request=None):
+        """Wake up the processing thread."""
+        self._requests.wakeup(request)
 
     def destroy(self):
-        """Stop the Proton thread, releasing all resources.
+        """Stop the processing thread, releasing all resources.
         """
         LOG.debug("Stopping Proton container %s" % self._container.name)
-        self._shutdown = True
-        self.wakeup()
+        self.wakeup(lambda: self._do_shutdown())
         self.join()
 
-    def connect(self, hostname, port=5672, properties={}, name=None):
+    def _do_shutdown(self):
+        self._shutdown = True
+
+    def connect(self, hostname, port=5672, properties={}, name=None,
+                sasl_mechanisms="ANONYMOUS", handler=None):
         """Get a _SocketConnection to a peer represented by url."""
         key = name or "%s:%i" % (hostname, port)
         # return pre-existing
-        with self._proton_lock:
-            conn = self._container.get_connection(key)
+        conn = self._container.get_connection(key)
         if conn:
             assert isinstance(conn.user_context, _SocketConnection)
             return conn.user_context
@@ -243,13 +242,14 @@ class ContainerIO(threading.Thread):
         # no name was provided, the host:port combination
         sc = _SocketConnection(key, my_socket,
                                self._container,
-                               self._proton_lock,
-                               properties)
-        if self.conf.amqp10_sasl_mechanisms:
+                               properties, handler=handler)
+        if sasl_mechanisms:
                 pn_sasl = sc.connection.sasl
-                pn_sasl.mechanisms(self.conf.amqp10_sasl_mechanisms)
+                pn_sasl.mechanisms(sasl_mechanisms)
                 # @todo KAG: server if accepting inbound connections
                 pn_sasl.client()
+        sc.connection.open()
+        self.wakeup()
         return sc
 
     def run(self):
@@ -258,21 +258,13 @@ class ContainerIO(threading.Thread):
                   self._container.name)
 
         while not self._shutdown:
-            readfd = [self._tasks.pipe()[0]]
-            writefd = []
+            readers, writers, timers = self._container.need_processing()
 
-            with self._proton_lock:
-                readers, writers, timers = self._container.need_processing()
-
-            # map fusion Connections back to my SocketConnections
-            for c in readers:
-                sc = c.user_context
-                assert sc and isinstance(sc, _SocketConnection)
-                readfd.append(sc)
-            for c in writers:
-                sc = c.user_context
-                assert sc and isinstance(sc, _SocketConnection)
-                writefd.append(sc)
+            readfds = [c.user_context for c in readers]
+            # additionally, always check for readability of pipe we
+            # are using to wakeup processing thread by other threads
+            readfds.append(self._requests)
+            writefds = [c.user_context for c in writers]
 
             timeout = None
             if timers:
@@ -282,87 +274,22 @@ class ContainerIO(threading.Thread):
 
             LOG.debug(_("proton thread select() call (timeout=%s)"),
                       str(timeout))
-            readable, writable, ignore = select.select(readfd,
-                                                       writefd,
+            readable, writable, ignore = select.select(readfds,
+                                                       writefds,
                                                        [],
                                                        timeout)
             LOG.debug(_("select() returned"))
 
-            while os.read(self._tasks.pipe()[0], 512):
-                pass
-
             for r in readable:
-                if r is self._tasks.pipe()[0]:
-                    continue
-                assert isinstance(r, _SocketConnection)
-
-                # @todo: KAG update to use utility method
-                with self._proton_lock:
-                    count = r.connection.needs_input
-                    if count > 0:
-                        try:
-                            sock_data = r.socket.recv(count)
-                            if sock_data:
-                                r.connection.process_input(sock_data)
-                            else:
-                                # closed?
-                                r.connection.close_input()
-                        except socket.timeout as e:
-                            # I don't expect this
-                            LOG.warn(_("Unexpected socket timeout %s"), str(e))
-                        except socket.error as e:
-                            err = e.args[0]
-                            # ignore non-fatal errors
-                            if (err != errno.EAGAIN and
-                                    err != errno.EWOULDBLOCK and
-                                    err != errno.EINTR):
-                                # otherwise, unrecoverable:
-                                r.connection.close_input()
-                                LOG.warn(_("Unexpected socket error %s"),
-                                         str(e))
-                        except Exception as e:  # beats me...
-                            r.connection.close_input()
-                            LOG.warn(_("Unknown socket error"), str(e))
-
-                        r.connection.process(time.time())
+                r.read()
 
             for t in timers:
                 if t.next_tick > time.time():
                     break
-                with self._proton_lock:
-                    t.process(time.time())
+                t.process(time.time())
 
             for w in writable:
-                # @todo: KAG update to use utility method
-                assert isinstance(w, _SocketConnection)
-                with self._proton_lock:
-                    data = w.connection.output_data()
-                    if data:
-                        try:
-                            rc = w.socket.send(data)
-                            if rc > 0:
-                                w.connection.output_written(rc)
-                            else:
-                                # else socket closed
-                                w.connection.close_output()
-                        except socket.timeout as e:
-                            # I don't expect this
-                            LOG.warn(_("Unexpected socket timeout %s"), str(e))
-                        except socket.error as e:
-                            err = e.args[0]
-                            # ignore non-fatal errors
-                            if (err != errno.EAGAIN and
-                                    err != errno.EWOULDBLOCK and
-                                    err != errno.EINTR):
-                                # otherwise, unrecoverable
-                                w.connection.close_output()
-                                LOG.warn(_("Unexpected socket error %s"),
-                                         str(e))
-                        except Exception as e:  # beats me...
-                            w.connection.close_output()
-                            LOG.warn(_("Unknown socket error %s"),
-                                     str(e))
-                        w.connection.process(time.time())
+                w.write()
 
         LOG.debug(_("Stopping Proton thread, container=%s"),
                   self._container.name)
@@ -371,42 +298,68 @@ class ContainerIO(threading.Thread):
 
 
 class Replies(proton_wrapper.ReceiverEventHandler):
-    def __init__(self, connection):
+    def __init__(self, connection, on_ready):
         self._correlation = {}  # map of correlation-id to response queue
         self._ready = False
-        self._replies = connection.create_receiver(dyanmic=True,
-                                                   eventHandler=self)
-        # can't handle a request until the replies link is active, as
-        # we need the peer assigned address
-        # TODO(grs) need to delay any processing of task queue until
-        # this is done
+        self._on_ready = on_ready
+        self._receiver = connection.create_receiver("replies",
+                                                    eventHandler=self)
+        self.capacity = 100  # somewhat arbitrary
+        self._credit = 0
+
+    def ready(self):
+        return self._ready
 
     def prepare_for_response(self, request, reply_queue):
         assert(self._ready)
         if reply_queue:
-            request.message_id = uuid.uuid4().hex
+            key = uuid.uuid4().hex
+            # TODO(grs): need to synchronise concurrent access to
+            # correlation table
+            self._correlation[key] = reply_queue
+            request.id = key
             request.reply_to = self._receiver.source_address
-            self._correlation[request.message_id] = reply_queue
 
     def receiver_active(self, receiver_link):
         self._ready = True
+        self._update_credit()
+        self._on_ready()
 
     def receiver_remote_closed(self, receiver, error=None):
+        # TODO(grs)
         LOG.error(_("Reply subscription closed by peer: %s"),
                   (error or "no error given"))
 
     def message_received(self, receiver, message, handle):
-        if message.correlation_id in self._correlation:
-            self._correlation[message.correlation_id].put(message)
+        self._credit = self._credit - 1
+        self._update_credit()
+
+        key = message.correlation_id
+        # TODO(grs): need to synchronise concurrent access to
+        # correlation table
+        if key in self._correlation:
+            LOG.debug("Received response for %s" % key)
+            self._correlation[key].put(message)
+            # cleanup (only have one response per request)
+            del self._correlation[key]
+        else:
+            LOG.warn("Can't correlate %s (%s)" % (key, self._correlation))
+
+    def _update_credit(self):
+        if self.capacity > self._credit:
+            self._receiver.add_capacity(self.capacity - self._credit)
+            self._credit = self.capacity
 
 
 class Server(proton_wrapper.ReceiverEventHandler):
     def __init__(self, connection, addresses, incoming):
         self._incoming = incoming
+        self._receivers = []
         for a in addresses:
             r = connection.create_receiver(source_address=a,
                                            target_address=a,
                                            eventHandler=self)
+            r.add_capacity(1)  # TODO(grs)
             self._receivers.append(r)
 
     def receiver_remote_closed(self, receiver, error=None):
@@ -418,16 +371,66 @@ class Server(proton_wrapper.ReceiverEventHandler):
         LOG.error(text % vals)
 
     def message_received(self, receiver, message, handle):
+        receiver.add_capacity(1)
         self._incoming.put(message)
 
 
-class ProtocolManager(object):
+class ProtocolManager(proton_wrapper.ConnectionEventHandler):
     def __init__(self, host, port=5672):
-        self._container_io = ContainerIO()
-        self._connection = self._container_io.connect(host, port)
-        self._replies = Replies(self._connection)
+        self.processor = ProcessingThread()
+        self._tasks = moves.queue.Queue()
         self._senders = {}
         self._servers = {}
+        # can't handle a request until the replies link is active, as
+        # we need the peer assigned address, so need to delay any
+        # processing of task queue until this is done
+        self._replies = None
+        self.processor.wakeup(lambda: self._do_connect(host, port))
+
+    def _do_connect(self, host, port=5672):
+        """Establish connection and reply subscripion on processor thread."""
+        self._socket_connection = self.processor.connect(host, port,
+                                                         handler=self)
+        self._connection = self._socket_connection.connection
+        LOG.debug("Connection initiated")
+
+    def connection_active(self, connection):
+        LOG.debug("Connection active, subscribing for replies")
+        self._replies = Replies(self._connection, lambda: self._ready())
+
+    def connection_closed(self, connection, reason):
+        LOG.info("Connection closed")
+
+    def _ready(self):
+        LOG.debug("Reply subscription ready (%s)" % (self._tasks.empty()))
+        if not self._tasks.empty():
+            self.processor.wakeup(lambda: self._process_tasks())
+
+    def _put_task(self, task):
+        """Add task for execution on processor thread."""
+        self._tasks.put(task)
+        if self._replies and self._replies.ready():
+            self.processor.wakeup(lambda: self._process_tasks())
+
+    def _process_tasks(self):
+        """Execute tasks on processor thread."""
+        while not self._tasks.empty():
+            try:
+                self._tasks.get(False).execute(self)
+            except Exception as e:
+                LOG.error(_("Error processing task: %s"), str(e))
+
+    def tasks(self):
+        class Tasks(object):
+            def __init__(self, mgr):
+                self._mgr = mgr
+
+            def put(self, task):
+                self._mgr._put_task(task)
+        return Tasks(self)
+
+    def destroy(self):
+        self.processor.destroy()
 
     def request(self, target, request, reply_queue=None):
         """Send a request to the given target, and arrange for a
@@ -441,6 +444,7 @@ class ProtocolManager(object):
         self._sender(address).send(response)
 
     def subscribe(self, target, requests):
+        LOG.debug("Subscribing to %s" % target)
         assert(target.topic)
         assert(target.server)
         server_address = "%s.%s" % (target.topic, target.server)
@@ -473,6 +477,18 @@ class ProtocolManager(object):
                                                     target_address=address)
             self._senders[address] = sender
         return sender
+
+    def _add_server_prefix(self, address):
+        #TODO(grs)
+        return "/queues/%s" % address
+
+    def _add_broadcast_prefix(self, address):
+        #TODO(grs)
+        return "/topics/%s" % address
+
+    def _add_group_request_prefix(self, address):
+        #TODO(grs)
+        return "/queues/%s" % address
 
 
 class Task(object):
@@ -515,25 +531,23 @@ class ReplyTask(Task):
         self._log_failure = log_failure
 
     def execute(self, manager):
-        manager.reply(self._address, self._response)
+        manager.response(self._address, self._response)
 
 
 def marshal_response(reply=None, failure=None):
     #TODO(grs): do replies have a context?
     msg = proton.Message()
-    if reply:
-        data = {"response": reply}
-    elif failure:
+    if failure:
         data = {"failure": failure}
     else:
-        raise Exception("Must specify either a reply or a failure")
-    msg.content = jsonutils.dumps(data)
+        data = {"response": reply}
+    msg.body = jsonutils.dumps(data)
     return msg
 
 
 def unmarshal_response(message):
     #TODO(grs)
-    data = jsonutils.loads(message.content)
+    data = jsonutils.loads(message.body)
     if "response" in data:
         return data["response"]
     elif "failure" in data:
@@ -551,40 +565,44 @@ def marshal_request(request, context, envelope):
         "request": request,
         "context": context
     }
-    msg.content = jsonutils.dumps(data)
+    msg.body = jsonutils.dumps(data)
     return msg
 
 
 def unmarshal_request(message):
     #TODO(grs)
-    data = jsonutils.loads(message.content)
+    data = jsonutils.loads(message.body)
     if "request" in data:
-        request = data["response"]
+        request = data["request"]
     if "context" in data:
         context = data["context"]
     return (request, context)
 
 
 class ProtonIncomingMessage(base.IncomingMessage):
-    def __init__(self, listener, ctxt, message, task_queue):
-        base.IncomingMessage.__init__(listener, ctxt, message)
+    def __init__(self, listener, ctxt, request, task_queue, message):
+        base.IncomingMessage.__init__(self, listener, ctxt, request)
         self._task_queue = task_queue
         self._reply_to = message.reply_to
+        self._correlation_id = message.id
 
     def reply(self, reply=None, failure=None, log_failure=True):
         response = marshal_response(reply=reply, failure=failure)
+        if self._correlation_id:
+            response.correlation_id = self._correlation_id
         self._task_queue.put(ReplyTask(self._reply_to, response, log_failure))
 
 
 class ProtonListener(base.Listener):
-    def __init__(self, driver, target, task_queue):
+    def __init__(self, driver, target, tasks):
         base.Listener.__init__(self, driver, target)
-        self._task_queue = task_queue
+        self._tasks = tasks
         self._incoming = moves.queue.Queue()
 
     def poll(self):
-        request, ctxt = unmarshal_request(self._incoming.get())
-        return ProtonIncomingMessage(self, ctxt, request, self._task_queue)
+        message = self._incoming.get()
+        request, ctxt = unmarshal_request(message)
+        return ProtonIncomingMessage(self, ctxt, request, self._tasks, message)
 
     def incoming(self):
         return self._incoming
@@ -594,9 +612,12 @@ class ProtonDriver(base.BaseDriver):
 
     def __init__(self, conf, url,
                  default_exchange=None, allowed_remote_exmods=[]):
-
         base.BaseDriver.__init__(self, conf, url, default_exchange,
                                  allowed_remote_exmods)
+        # TODO(grs): handle reconnect, authentication etc
+        hostname = url.hosts[0].hostname or "localhost"
+        port = url.hosts[0].port or 5672
+        self._mgr = ProtocolManager(hostname, port)
 
     def send(self, target, ctxt, message,
              wait_for_reply=None, timeout=None, envelope=False):
@@ -605,20 +626,24 @@ class ProtonDriver(base.BaseDriver):
         if timeout:
             request.ttl = timeout
         task = SendTask(target, request, wait_for_reply)
-        self._tasks.put(task)
-        reply = task.get_reply()
+        self._mgr.tasks().put(task)
+        reply = task.get_reply(timeout)
         if reply:
-            unmarshal_response(reply)
+            return unmarshal_response(reply)
+        else:
+            return None
 
     def send_notification(self, target, ctxt, message, version):
         """Send a notification message to the given target."""
 
     def listen(self, target):
         """Construct a Listener for the given target."""
-        listener = ProtonListener(self, target, self.tasks)
-        self._tasks.put(ListenTask(target, listener._incoming))
+        LOG.debug("Listen to %s" % target)
+        listener = ProtonListener(self, target, self._mgr.tasks())
+        self._mgr.tasks().put(ListenTask(target, listener._incoming))
         return listener
 
     def cleanup(self):
         """Release all resources."""
-        self._protocol_mgr.destroy()
+        LOG.info("Cleaning up ProtonDriver")
+        self._mgr.destroy()
