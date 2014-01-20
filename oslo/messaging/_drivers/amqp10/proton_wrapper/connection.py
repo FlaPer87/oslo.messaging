@@ -226,7 +226,7 @@ Associate an arbitrary user object with this Connection.
                 self._active = True
                 self._handler.connection_active(self)
 
-        pn_session = self._pn_connection.session_head()
+        pn_session = self._pn_connection.session_head(self._LOCAL_UNINIT)
         while pn_session:
             LOG.debug("Opening remotely initiated session")
             pn_session.open()
@@ -252,11 +252,13 @@ Associate an arbitrary user object with this Connection.
                 if pn_link.is_sender:
                     sender_link = pn_link.context
                     assert isinstance(sender_link, SenderLink)
-                    sender_link._handler.sender_active(sender_link)
+                    if sender_link._handler:
+                        sender_link._handler.sender_active(sender_link)
                 else:
                     receiver_link = pn_link.context
                     assert isinstance(receiver_link, ReceiverLink)
-                    receiver_link._handler.receiver_active(receiver_link)
+                    if receiver_link._handler:
+                        receiver_link._handler.receiver_active(receiver_link)
             pn_link = next_link
 
         # process the work queue
@@ -399,6 +401,7 @@ Associate an arbitrary user object with this Connection.
                            source_address, target_address,
                            eventHandler, properties)
             self._sender_links[ident] = s
+            pn_link.open()
             return s
         return None
 
@@ -437,6 +440,7 @@ Associate an arbitrary user object with this Connection.
             r = ReceiverLink(self, pn_link, target_address,
                              source_address, eventHandler, properties)
             self._receiver_links[ident] = r
+            pn_link.open()
             return r
         return None
 
