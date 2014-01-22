@@ -158,6 +158,7 @@ class _SocketConnection(proton_wrapper.ConnectionEventHandler):
     def sasl_done(self, connection, result):
         LOG.info("APP: SASL DONE: %s" % result)
 
+
 class Requests(object):
     def __init__(self):
         self._requests = moves.queue.Queue()
