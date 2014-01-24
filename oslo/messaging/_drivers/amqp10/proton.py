@@ -88,8 +88,6 @@ proton_opts = [
                 help='Enable protocol tracing')
 ]
 
-JSON_CONTENT_TYPE = 'application/json; charset=utf8'
-
 
 class _SocketConnection(proton_wrapper.ConnectionEventHandler):
     """Associates a proton Connection with a python network socket,
@@ -313,11 +311,8 @@ class Replies(proton_wrapper.ReceiverEventHandler):
     def prepare_for_response(self, request, reply_queue):
         assert(self._ready)
         if reply_queue:
-            key = uuid.uuid4().hex
-            # TODO(grs): need to synchronise concurrent access to
-            # correlation table
-            self._correlation[key] = reply_queue
-            request.id = key
+            request.id = uuid.uuid4().hex
+            self._correlation[request.id] = reply_queue
             request.reply_to = self._receiver.source_address
 
     def receiver_active(self, receiver_link):
@@ -335,12 +330,10 @@ class Replies(proton_wrapper.ReceiverEventHandler):
         self._update_credit()
 
         key = message.correlation_id
-        # TODO(grs): need to synchronise concurrent access to
-        # correlation table
         if key in self._correlation:
             LOG.debug("Received response for %s" % key)
             self._correlation[key].put(message)
-            # cleanup (only have one response per request)
+            # cleanup (only need one response per request)
             del self._correlation[key]
         else:
             LOG.warn("Can't correlate %s (%s)" % (key, self._correlation))
@@ -381,15 +374,25 @@ class ProtocolManager(proton_wrapper.ConnectionEventHandler):
         self._tasks = moves.queue.Queue()
         self._senders = {}
         self._servers = {}
+        self.host = host
+        self.port = port
+        self.separator = "."
+        self.fanout_qualifier = "all"
+        self.server_request_prefix = "exclusive"
+        self.broadcast_prefix = "broadcast"
+        self.group_request_prefix = "unicast"
+        self.default_exchange = None
         # can't handle a request until the replies link is active, as
         # we need the peer assigned address, so need to delay any
         # processing of task queue until this is done
         self._replies = None
-        self.processor.wakeup(lambda: self._do_connect(host, port))
 
-    def _do_connect(self, host, port=5672):
+    def connect(self):
+        self.processor.wakeup(lambda: self._do_connect())
+
+    def _do_connect(self):
         """Establish connection and reply subscripion on processor thread."""
-        self._socket_connection = self.processor.connect(host, port,
+        self._socket_connection = self.processor.connect(self.host, self.port,
                                                          handler=self)
         self._connection = self._socket_connection.connection
         LOG.debug("Connection initiated")
@@ -438,34 +441,34 @@ class ProtocolManager(proton_wrapper.ConnectionEventHandler):
         """
         address = self._resolve(target)
         self._replies.prepare_for_response(request, reply_queue)
-        self._sender(address).send(request)
+        self._send(address, request)
 
     def response(self, address, response):
-        self._sender(address).send(response)
+        self._send(address, response)
 
     def subscribe(self, target, requests):
         LOG.debug("Subscribing to %s" % target)
         assert(target.topic)
         assert(target.server)
-        server_address = "%s.%s" % (target.topic, target.server)
-        broadcast_address = "broadcast.%s" % target.topic
         addresses = [
-            self._add_server_prefix(server_address),
-            self._add_broadcast_prefix(broadcast_address),
-            self._add_group_request_prefix(target.topic)
+            self._server_address(target),
+            self._broadcast_address(target),
+            self._group_request_address(target)
         ]
         self._servers[target] = Server(self._connection, addresses, requests)
 
     def _resolve(self, target):
+        assert(target.topic)
         if target.server:
-            address = "%s.%s" % (target.topic, target.server)
-            address = self._add_server_prefix(address)
+            return self._server_address(target)
         elif target.fanout:
-            address = "broadcast.%s" % target.topic
-            address = self._add_broadcast_prefix(address)
+            return self._broadcast_address(target)
         else:
-            address = self._add_group_request_prefix(target.topic)
-        return address
+            return self._group_request_address(target)
+
+    def _send(self, address, message):
+        message.address = address
+        self._sender(address).send(message)
 
     def _sender(self, address):
         # if we already have a sender for that address, use it
@@ -478,17 +481,23 @@ class ProtocolManager(proton_wrapper.ConnectionEventHandler):
             self._senders[address] = sender
         return sender
 
-    def _add_server_prefix(self, address):
-        #TODO(grs)
-        return "/queues/%s" % address
+    def _server_address(self, target):
+        return self._concatenate([self.server_request_prefix,
+                                  target.exchange or self.default_exchange,
+                                  target.topic, target.server])
 
-    def _add_broadcast_prefix(self, address):
-        #TODO(grs)
-        return "/topics/%s" % address
+    def _broadcast_address(self, target):
+        return self._concatenate([self.broadcast_prefix,
+                                  target.exchange or self.default_exchange,
+                                  target.topic, self.fanout_qualifier])
 
-    def _add_group_request_prefix(self, address):
-        #TODO(grs)
-        return "/queues/%s" % address
+    def _group_request_address(self, target):
+        return self._concatenate([self.group_request_prefix,
+                                  target.exchange or self.default_exchange,
+                                  target.topic])
+
+    def _concatenate(self, items):
+        return self.separator.join(filter(bool, items))
 
 
 class Task(object):
@@ -505,6 +514,8 @@ class SendTask(Task):
         self._request = request
         if reply_expected:
             self._reply_queue = moves.queue.Queue()
+        else:
+            self._reply_queue = None
 
     def execute(self, manager):
         manager.request(self._target, self._request, self._reply_queue)
@@ -546,20 +557,20 @@ def marshal_response(reply=None, failure=None):
 
 
 def unmarshal_response(message):
-    #TODO(grs)
     data = jsonutils.loads(message.body)
     if "response" in data:
         return data["response"]
     elif "failure" in data:
+        #TODO(grs)
         #???
         raise Exception(str(data))
     else:
+        #TODO(grs)
         #???
         return data
 
 
 def marshal_request(request, context, envelope):
-    #TODO(grs)
     msg = proton.Message()
     data = {
         "request": request,
@@ -570,7 +581,6 @@ def marshal_request(request, context, envelope):
 
 
 def unmarshal_request(message):
-    #TODO(grs)
     data = jsonutils.loads(message.body)
     if "request" in data:
         request = data["request"]
@@ -614,10 +624,19 @@ class ProtonDriver(base.BaseDriver):
                  default_exchange=None, allowed_remote_exmods=[]):
         base.BaseDriver.__init__(self, conf, url, default_exchange,
                                  allowed_remote_exmods)
+        conf.register_opts(proton_opts)
         # TODO(grs): handle reconnect, authentication etc
         hostname = url.hosts[0].hostname or "localhost"
         port = url.hosts[0].port or 5672
         self._mgr = ProtocolManager(hostname, port)
+        if conf.server_request_prefix:
+            self._mgr.server_request_prefix = conf.server_request_prefix
+        if conf.broadcast_prefix:
+            self._mgr.broadcast_prefix = conf.broadcast_prefix
+        if conf.group_request_prefix:
+            self._mgr.group_request_prefix = conf.group_request_prefix
+        self._mgr.default_exchange = default_exchange
+        self._mgr.connect()
 
     def send(self, target, ctxt, message,
              wait_for_reply=None, timeout=None, envelope=False):
