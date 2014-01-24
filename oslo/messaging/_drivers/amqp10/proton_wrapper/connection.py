@@ -287,11 +287,13 @@ Associate an arbitrary user object with this Connection.
                 if pn_link.is_sender:
                     sender_link = pn_link.context
                     handler = pn_link.context._handler
-                    handler.sender_remote_closed(sender_link, None)
+                    if handler:
+                        handler.sender_remote_closed(sender_link, None)
                 else:
                     receiver_link = pn_link.context
                     handler = pn_link.context._handler
-                    handler.receiver_remote_closed(receiver_link, None)
+                    if handler:
+                        handler.receiver_remote_closed(receiver_link, None)
             pn_link = next_link
 
         pn_link = self._pn_connection.link_head(self._CLOSED)
