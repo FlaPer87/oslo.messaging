@@ -35,6 +35,10 @@ class ConnectionEventHandler(object):
         """Connection handshake has completed."""
         LOG.debug("connection_active (ignored)")
 
+    def connection_failed(self, connection):
+        """Connection's transport has failed in some way."""
+        LOG.warn("connection_failed (ignored)")
+
     def connection_remote_closed(self, connection, error=None):
         LOG.debug("connection_remote_closed (ignored)")
 
@@ -343,9 +347,16 @@ Associate an arbitrary user object with this Connection.
     def needs_input(self):
         if self._read_done:
             return self.EOS
-        capacity = self._pn_transport.capacity()
-        if capacity >= 0:
-            return capacity
+        try:
+            #TODO(grs): can this actually throw?
+            capacity = self._pn_transport.capacity()
+            if capacity >= 0:
+                return capacity
+        except Exception as e:
+            if self._handler:
+                self._handler.connection_failed(self, str(e))
+            else:
+                LOG.error("Connection failed: %s", str(e))
         self._read_done = True
         return self.EOS
 
@@ -370,9 +381,15 @@ Associate an arbitrary user object with this Connection.
         if self._write_done:
             return self.EOS
 
-        pending = self._pn_transport.pending()
-        if pending >= 0:
-            return pending
+        try:
+            pending = self._pn_transport.pending()
+            if pending >= 0:
+                return pending
+        except Exception as e:
+            if self._handler:
+                self._handler.connection_failed(self, str(e))
+            else:
+                LOG.error("Connection failed: %s", str(e))
         self._write_done = True
         return self.EOS
 

@@ -89,20 +89,19 @@ proton_opts = [
 ]
 
 
-class _SocketConnection(proton_wrapper.ConnectionEventHandler):
+class _SocketConnection():
     """Associates a proton Connection with a python network socket,
     and handles all connection-related events.
     """
 
-    def __init__(self, name, socket, container,
-                 properties, handler=None):
+    def __init__(self, name, container, properties, handler):
         self.name = name
-        self.socket = socket
         self._properties = properties
-        self.connection = container.create_connection(name,
-                                                      handler or self,
-                                                      properties)
-        self.connection.user_context = self
+        self._handler = handler
+        self._container = container
+        c = container.create_connection(name, handler, properties)
+        c.user_context = self
+        self.connection = c
 
     def fileno(self):
         """Allows use of a _SocketConnection in a select() call.
@@ -114,8 +113,9 @@ class _SocketConnection(proton_wrapper.ConnectionEventHandler):
         try:
             rc = proton_wrapper.sockets.read_socket_input(self.connection,
                                                           self.socket)
-        except Exception:
+        except Exception as e:
             rc = proton_wrapper.Connection.EOS
+            self._handler.connection_failed(self.connection, str(e))
         if rc > 0:
             self.connection.process(time.time())
         return rc
@@ -125,36 +125,47 @@ class _SocketConnection(proton_wrapper.ConnectionEventHandler):
         try:
             rc = proton_wrapper.sockets.write_socket_output(self.connection,
                                                             self.socket)
-        except Exception:
+        except Exception as e:
             rc = proton_wrapper.Connection.EOS
+            self._handler.connection_failed(self.connection, str(e))
         if rc > 0:
             self.connection.process(time.time())
         return rc
 
-    # ConnectionEventHandler callbacks
-    def connection_active(self, connection):
-        LOG.info("APP: CONN ACTIVE")
+    def connect(self, hostname, port, sasl_mechanisms="ANONYMOUS"):
+        addr = socket.getaddrinfo(hostname, port,
+                                  socket.AF_INET, socket.SOCK_STREAM)
+        if not addr:
+            key = "%s:%i" % (hostname, port)
+            error = _("Could not translate address '%s'") % key
+            LOG.warn(error)
+            self.handler.connection_failed(self.connection, error)
+        my_socket = socket.socket(addr[0][0], addr[0][1], addr[0][2])
+        my_socket.setblocking(0)  # 0=non-blocking
+        try:
+            my_socket.connect(addr[0][4])
+        except socket.error as e:
+            if e[0] != errno.EINPROGRESS:
+                error = _("Socket connect failure '%s'") % str(e)
+                LOG.warn(error)
+                self.handler.connection_failed(self.connection, str(e))
+        self.socket = my_socket
 
-    def connection_closed(self, connection, reason):
-        LOG.info("APP: CONN CLOSED")
+        if sasl_mechanisms:
+            pn_sasl = self.connection.sasl
+            pn_sasl.mechanisms(sasl_mechanisms)
+            # @todo KAG: server if accepting inbound connections
+            pn_sasl.client()
+        self.connection.open()
 
-    def sender_requested(self, connection, link_handle,
-                         requested_source, properties):
-        ## @todo: support needed for peer-2-peer
-        LOG.info("APP: SENDER LINK REQUESTED")
-
-    def receiver_requested(self, connection, link_handle,
-                           requested_target, properties):
-        ## @todo: support needed for peer-2-peer
-        LOG.info("APP: RECEIVER LINK REQUESTED")
-
-    # SASL callbacks:
-
-    def sasl_step(self, connection, pn_sasl):
-        LOG.info("SASL STEP")
-
-    def sasl_done(self, connection, result):
-        LOG.info("APP: SASL DONE: %s" % result)
+    def reset(self, name=None):
+        self._container.remove_connection(self.name)
+        if name:
+            self.name = name
+        c = self._container.create_connection(self.name, self._handler,
+                                              self._properties)
+        c.user_context = self
+        self.connection = c
 
 
 class Requests(object):
@@ -209,8 +220,8 @@ class ProcessingThread(threading.Thread):
     def _do_shutdown(self):
         self._shutdown = True
 
-    def connect(self, hostname, port=5672, properties={}, name=None,
-                sasl_mechanisms="ANONYMOUS", handler=None):
+    def connect(self, hostname, port, handler, properties={}, name=None,
+                sasl_mechanisms="ANONYMOUS"):
         """Get a _SocketConnection to a peer represented by url."""
         key = name or "%s:%i" % (hostname, port)
         # return pre-existing
@@ -219,35 +230,12 @@ class ProcessingThread(threading.Thread):
             assert isinstance(conn.user_context, _SocketConnection)
             return conn.user_context
 
-        addr = socket.getaddrinfo(hostname, port,
-                                  socket.AF_INET, socket.SOCK_STREAM)
-        if not addr:
-            error = _("Could not translate address '%s'") % key
-            LOG.warn(error)
-            raise Exception(error)
-        my_socket = socket.socket(addr[0][0], addr[0][1], addr[0][2])
-        my_socket.setblocking(0)  # 0=non-blocking
-        try:
-            my_socket.connect(addr[0][4])
-        except socket.error as e:
-            if e[0] != errno.EINPROGRESS:
-                error = _("Socket connect failure '%s'") % str(e)
-                LOG.warn(error)
-                raise Exception(error)
-
         # create a new connection - this will be stored in the
         # container, using the specified name as the lookup key, or if
         # no name was provided, the host:port combination
-        sc = _SocketConnection(key, my_socket,
-                               self._container,
+        sc = _SocketConnection(key, self._container,
                                properties, handler=handler)
-        if sasl_mechanisms:
-                pn_sasl = sc.connection.sasl
-                pn_sasl.mechanisms(sasl_mechanisms)
-                # @todo KAG: server if accepting inbound connections
-                pn_sasl.client()
-        sc.connection.open()
-        self.wakeup()
+        sc.connect(hostname, port, sasl_mechanisms)
         return sc
 
     def run(self):
@@ -347,8 +335,12 @@ class Replies(proton_wrapper.ReceiverEventHandler):
 class Server(proton_wrapper.ReceiverEventHandler):
     def __init__(self, connection, addresses, incoming):
         self._incoming = incoming
+        self._addresses = addresses
+        self.attach(connection)
+
+    def attach(self, connection):
         self._receivers = []
-        for a in addresses:
+        for a in self._addresses:
             r = connection.create_receiver(source_address=a,
                                            target_address=a,
                                            eventHandler=self)
@@ -397,12 +389,27 @@ class ProtocolManager(proton_wrapper.ConnectionEventHandler):
         self._connection = self._socket_connection.connection
         LOG.debug("Connection initiated")
 
+    def connection_failed(self, connection, error):
+        LOG.debug("Connection failure: %s" % error)
+        if self._connection == connection:
+            self._replies = None
+            self._senders = {}
+            self._socket_connection.reset()
+            self._connection = self._socket_connection.connection
+            self._socket_connection.connect(self.host, self.port)
+            LOG.info("Reconnecting to: %s:%i" % (self.host, self.port))
+
     def connection_active(self, connection):
         LOG.debug("Connection active, subscribing for replies")
+        for s in self._servers.itervalues():
+            s.attach(self._connection)
         self._replies = Replies(self._connection, lambda: self._ready())
 
     def connection_closed(self, connection, reason):
-        LOG.info("Connection closed")
+        if reason:
+            LOG.info("Connection closed: %s" % reason)
+        else:
+            LOG.info("Connection closed")
 
     def _ready(self):
         LOG.debug("Reply subscription ready (%s)" % (self._tasks.empty()))
@@ -664,5 +671,5 @@ class ProtonDriver(base.BaseDriver):
 
     def cleanup(self):
         """Release all resources."""
-        LOG.info("Cleaning up ProtonDriver")
+        LOG.debug("Cleaning up ProtonDriver")
         self._mgr.destroy()

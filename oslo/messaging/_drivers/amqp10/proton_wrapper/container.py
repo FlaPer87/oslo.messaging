@@ -87,6 +87,9 @@ class Container(object):
     def get_connection(self, name):
         return self._connections.get(name, None)
 
+    def remove_connection(self, name):
+        self._remove_connection(name)
+
     def _remove_connection(self, name):
         if name in self._connections:
             del self._connections[name]
