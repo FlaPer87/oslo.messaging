@@ -15,6 +15,7 @@
 
 import abc
 import errno
+import heapq
 import logging
 import os
 import select
@@ -50,15 +51,6 @@ proton_opts = [
                default='',
                help="address prefix when sending to any server in group"),
 
-    cfg.StrOpt('gateway_hostname',
-               default='localhost',
-               help='hostname of next-hop'),
-    cfg.IntOpt('gateway_port',
-               default=5672,
-               help='port for next-hop'),
-    cfg.ListOpt('gateway_hosts',
-                default=['$gateway_hostname:$gateway_port'],
-                help='Set of available next-hops'),
     cfg.StrOpt('amqp10_username',
                default='',
                help='Username for next-hop connection'),
@@ -168,6 +160,36 @@ class _SocketConnection():
         self.connection = c
 
 
+class Schedule(object):
+    def __init__(self):
+        self._entries = []
+
+    def schedule(self, request, delay):
+        assert request
+        assert delay
+        entry = (time.time() + delay, request)
+        heapq.heappush(self._entries, entry)
+
+    def timeout(self, t):
+        due = self.next()
+        if not due:
+            return t
+        now = time.time()
+        if due < now:
+            return 0
+        else:
+            return min(due - now, t) if t else due - now
+
+    def next(self):
+        return self._entries[0][0] if len(self._entries) else None
+
+    def process(self):
+        n = self.next()
+        while n and n < time.time():
+            heapq.heappop(self._entries)[1]()
+            n = self.next()
+
+
 class Requests(object):
     def __init__(self):
         self._requests = moves.queue.Queue()
@@ -194,6 +216,8 @@ class ProcessingThread(threading.Thread):
 
         # handle requests from other threads
         self._requests = Requests()
+        # handle delayed tasks (only used on this thread for now)
+        self._schedule = Schedule()
 
         # Configure a container
         if container_name:
@@ -209,6 +233,9 @@ class ProcessingThread(threading.Thread):
     def wakeup(self, request=None):
         """Wake up the processing thread."""
         self._requests.wakeup(request)
+
+    def schedule(self, request, delay):
+        self._schedule.schedule(request, delay)
 
     def destroy(self):
         """Stop the processing thread, releasing all resources.
@@ -258,6 +285,8 @@ class ProcessingThread(threading.Thread):
                 now = time.time()
                 timeout = 0 if deadline <= now else deadline - now
 
+            timeout = self._schedule.timeout(timeout)
+
             LOG.debug(_("proton thread select() call (timeout=%s)"),
                       str(timeout))
             readable, writable, ignore = select.select(readfds,
@@ -269,6 +298,7 @@ class ProcessingThread(threading.Thread):
             for r in readable:
                 r.read()
 
+            self._schedule.process()
             for t in timers:
                 if t.next_tick > time.time():
                     break
@@ -360,20 +390,52 @@ class Server(proton_wrapper.ReceiverEventHandler):
         self._incoming.put(message)
 
 
+class Hosts(object):
+    def __init__(self, entries=[]):
+        self._entries = entries
+        self._current = 0
+
+    def add(self, hostname, port=5672):
+        self._entries.append((hostname, port))
+
+    def current(self):
+        if len(self._entries):
+            return self._entries[self._current]
+        else:
+            return ("localhost", 5672)
+
+    def next(self):
+        if len(self._entries) > 1:
+            self._current = (self._current + 1) % len(self._entries)
+        return self.current()
+
+    def hostname(self):
+        return self.current()[0]
+
+    def port(self):
+        return self.current()[1]
+
+    def __repr__(self):
+        return '<Hosts ' + str(self) + '>'
+
+    def __str__(self):
+        return ", ".join(["%s:%i" % e for e in self._entries])
+
+
 class ProtocolManager(proton_wrapper.ConnectionEventHandler):
-    def __init__(self, host, port=5672):
+    def __init__(self, hosts=Hosts()):
         self.processor = ProcessingThread()
         self._tasks = moves.queue.Queue()
         self._senders = {}
         self._servers = {}
-        self.host = host
-        self.port = port
+        self.hosts = hosts
         self.separator = "."
         self.fanout_qualifier = "all"
         self.server_request_prefix = "exclusive"
         self.broadcast_prefix = "broadcast"
         self.group_request_prefix = "unicast"
         self.default_exchange = None
+        self._delay = 0
         # can't handle a request until the replies link is active, as
         # we need the peer assigned address, so need to delay any
         # processing of task queue until this is done
@@ -384,26 +446,39 @@ class ProtocolManager(proton_wrapper.ConnectionEventHandler):
 
     def _do_connect(self):
         """Establish connection and reply subscripion on processor thread."""
-        self._socket_connection = self.processor.connect(self.host, self.port,
+        hostname, port = self.hosts.current()
+        self._socket_connection = self.processor.connect(hostname, port,
                                                          handler=self)
         self._connection = self._socket_connection.connection
         LOG.debug("Connection initiated")
 
+    def _do_reconnect(self):
+        self._senders = {}
+        self._socket_connection.reset()
+        self._connection = self._socket_connection.connection
+        hostname, port = self.hosts.next()
+        self._socket_connection.connect(hostname, port)
+        LOG.info("Reconnecting to: %s:%i" % (hostname, port))
+
     def connection_failed(self, connection, error):
         LOG.debug("Connection failure: %s" % error)
-        if self._connection == connection:
+        if self._connection == connection or self._replies:
             self._replies = None
-            self._senders = {}
-            self._socket_connection.reset()
-            self._connection = self._socket_connection.connection
-            self._socket_connection.connect(self.host, self.port)
-            LOG.info("Reconnecting to: %s:%i" % (self.host, self.port))
+            if self._delay == 0:
+                self._delay = 1
+                self._do_reconnect()
+            else:
+                d = self._delay
+                LOG.info("delaying reconnect attempt for %d seconds" % d)
+                self.processor.schedule(lambda: self._do_reconnect(), d)
+                self._delay = min(d * 2, 60)
 
     def connection_active(self, connection):
         LOG.debug("Connection active, subscribing for replies")
         for s in self._servers.itervalues():
             s.attach(self._connection)
         self._replies = Replies(self._connection, lambda: self._ready())
+        self._delay = 0
 
     def connection_closed(self, connection, reason):
         if reason:
@@ -412,6 +487,7 @@ class ProtocolManager(proton_wrapper.ConnectionEventHandler):
             LOG.info("Connection closed")
 
     def _ready(self):
+        LOG.info("Messaging is active (%s:%i)" % self.hosts.current())
         LOG.debug("Reply subscription ready (%s)" % (self._tasks.empty()))
         if not self._tasks.empty():
             self.processor.wakeup(lambda: self._process_tasks())
@@ -632,10 +708,9 @@ class ProtonDriver(base.BaseDriver):
         base.BaseDriver.__init__(self, conf, url, default_exchange,
                                  allowed_remote_exmods)
         conf.register_opts(proton_opts)
-        # TODO(grs): handle reconnect, authentication etc
-        hostname = url.hosts[0].hostname or "localhost"
-        port = url.hosts[0].port or 5672
-        self._mgr = ProtocolManager(hostname, port)
+        # TODO(grs): handle ssl, authentication etc
+        hosts = Hosts([(h.hostname, h.port or 5672) for h in url.hosts])
+        self._mgr = ProtocolManager(hosts)
         if conf.server_request_prefix:
             self._mgr.server_request_prefix = conf.server_request_prefix
         if conf.broadcast_prefix:
