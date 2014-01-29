@@ -28,9 +28,9 @@ from oslo.config import cfg
 
 from six import moves
 
-from oslo.messaging._drivers.amqp10 import proton_wrapper
 from oslo.messaging._drivers import base
 from oslo.messaging._drivers import common as rpc_common
+from oslo.messaging._drivers.protocols.amqp import engine
 from oslo.messaging.openstack.common import importutils
 from oslo.messaging.openstack.common import jsonutils
 
@@ -82,10 +82,10 @@ class _SocketConnection():
     def read(self):
         """Called when socket is read-ready."""
         try:
-            rc = proton_wrapper.sockets.read_socket_input(self.connection,
-                                                          self.socket)
+            rc = engine.sockets.read_socket_input(self.connection,
+                                                  self.socket)
         except Exception as e:
-            rc = proton_wrapper.Connection.EOS
+            rc = engine.Connection.EOS
             self._handler.connection_failed(self.connection, str(e))
         if rc > 0:
             self.connection.process(time.time())
@@ -94,10 +94,10 @@ class _SocketConnection():
     def write(self):
         """Called when socket is write-ready."""
         try:
-            rc = proton_wrapper.sockets.write_socket_output(self.connection,
-                                                            self.socket)
+            rc = engine.sockets.write_socket_output(self.connection,
+                                                    self.socket)
         except Exception as e:
-            rc = proton_wrapper.Connection.EOS
+            rc = engine.Connection.EOS
             self._handler.connection_failed(self.connection, str(e))
         if rc > 0:
             self.connection.process(time.time())
@@ -200,9 +200,9 @@ class ProcessingThread(threading.Thread):
 
         # Configure a container
         if container_name:
-            self._container = proton_wrapper.Container(container_name)
+            self._container = engine.Container(container_name)
         else:
-            self._container = proton_wrapper.Container(uuid.uuid4().hex)
+            self._container = engine.Container(uuid.uuid4().hex)
 
         self.name = "Thread for Proton container: %s" % self._container.name
         self._shutdown = False
@@ -292,7 +292,7 @@ class ProcessingThread(threading.Thread):
         # requests from being created
 
 
-class Replies(proton_wrapper.ReceiverEventHandler):
+class Replies(engine.ReceiverEventHandler):
     def __init__(self, connection, on_ready):
         self._correlation = {}  # map of correlation-id to response queue
         self._ready = False
@@ -341,7 +341,7 @@ class Replies(proton_wrapper.ReceiverEventHandler):
             self._credit = self.capacity
 
 
-class Server(proton_wrapper.ReceiverEventHandler):
+class Server(engine.ReceiverEventHandler):
     def __init__(self, connection, addresses, incoming):
         self._incoming = incoming
         self._addresses = addresses
@@ -401,7 +401,7 @@ class Hosts(object):
         return ", ".join(["%s:%i" % e for e in self._entries])
 
 
-class ProtocolManager(proton_wrapper.ConnectionEventHandler):
+class ProtocolManager(engine.ConnectionEventHandler):
     def __init__(self, hosts=Hosts(), container_name=None):
         self.processor = ProcessingThread(container_name)
         self._tasks = moves.queue.Queue()
