@@ -30,6 +30,7 @@ from six import moves
 
 from oslo.messaging._drivers.amqp10 import proton_wrapper
 from oslo.messaging._drivers import base
+from oslo.messaging._drivers import common as rpc_common
 from oslo.messaging.openstack.common import importutils
 from oslo.messaging.openstack.common import jsonutils
 
@@ -51,33 +52,11 @@ proton_opts = [
                default='',
                help="address prefix when sending to any server in group"),
 
-    cfg.StrOpt('amqp10_username',
+    cfg.StrOpt('amqp_container_name',
                default='',
-               help='Username for next-hop connection'),
-    cfg.StrOpt('amqp10_password',
-               default='',
-               help='Password for next-hop connection',
-               secret=True),
-    cfg.StrOpt('amqp10_sasl_mechanisms',
-               default='',
-               help='Space separated list of SASL mechanisms to use for auth'),
-    cfg.IntOpt('amqp10_idle_timeout',
-               default=0,
-               help='Seconds before idle connections are dropped'),
-    cfg.StrOpt('amqp10_container_name',
-               default='',
-               help='Name for the AMQP container'),
+               help='Name for the AMQP container')
 
     # @todo: other options?
-
-    # for now:
-    cfg.BoolOpt('amqp10_point_to_point',
-                default=False,
-                help='Enable point-to-point messaging.'),
-
-    cfg.BoolOpt('proton_trace',
-                default=False,
-                help='Enable protocol tracing')
 ]
 
 
@@ -423,8 +402,8 @@ class Hosts(object):
 
 
 class ProtocolManager(proton_wrapper.ConnectionEventHandler):
-    def __init__(self, hosts=Hosts()):
-        self.processor = ProcessingThread()
+    def __init__(self, hosts=Hosts(), container_name=None):
+        self.processor = ProcessingThread(container_name)
         self._tasks = moves.queue.Queue()
         self._senders = {}
         self._servers = {}
@@ -632,6 +611,7 @@ def marshal_response(reply=None, failure=None):
     #TODO(grs): do replies have a context?
     msg = proton.Message()
     if failure:
+        failure = rpc_common.serialize_remote_exception(failure)
         data = {"failure": failure}
     else:
         data = {"response": reply}
@@ -639,14 +619,14 @@ def marshal_response(reply=None, failure=None):
     return msg
 
 
-def unmarshal_response(message):
+def unmarshal_response(message, allowed):
     data = jsonutils.loads(message.body)
     if "response" in data:
         return data["response"]
     elif "failure" in data:
         #TODO(grs)
-        #???
-        raise Exception(str(data))
+        failure = data["failure"]
+        return rpc_common.deserialize_remote_exception(failure, allowed)
     else:
         #TODO(grs)
         #???
@@ -655,6 +635,8 @@ def unmarshal_response(message):
 
 def marshal_request(request, context, envelope):
     msg = proton.Message()
+    if envelope:
+        request = rpc_common.serialize_msg(request)
     data = {
         "request": request,
         "context": context
@@ -710,7 +692,8 @@ class ProtonDriver(base.BaseDriver):
         conf.register_opts(proton_opts)
         # TODO(grs): handle ssl, authentication etc
         hosts = Hosts([(h.hostname, h.port or 5672) for h in url.hosts])
-        self._mgr = ProtocolManager(hosts)
+        cname = conf.amqp_container_name if conf.amqp_container_name else None
+        self._mgr = ProtocolManager(hosts, cname)
         if conf.server_request_prefix:
             self._mgr.server_request_prefix = conf.server_request_prefix
         if conf.broadcast_prefix:
@@ -730,12 +713,13 @@ class ProtonDriver(base.BaseDriver):
         self._mgr.tasks().put(task)
         reply = task.get_reply(timeout)
         if reply:
-            return unmarshal_response(reply)
+            return unmarshal_response(reply, self._allowed_remote_exmods)
         else:
             return None
 
     def send_notification(self, target, ctxt, message, version):
         """Send a notification message to the given target."""
+        return self.send(target, ctxt, message, envelope=(version == 2.0))
 
     def listen(self, target):
         """Construct a Listener for the given target."""
