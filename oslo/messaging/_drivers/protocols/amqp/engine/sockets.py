@@ -75,12 +75,17 @@ def read_socket_input(connection, socket_obj):
 def write_socket_output(connection, socket_obj):
     """Write data to the network layer.  Can support both blocking and
     non-blocking sockets.
+    Returns the number of output bytes sent, or EOS if output processing
+    is done.  Any exceptions raised by the socket are re-raised.
     """
     count = connection.has_output
     if count <= 0:
         return count  # 0 or EOS
 
     data = connection.output_data()
+    if not data:
+        # error - has_output > 0, but no data?
+        return Connection.EOS
     try:
         count = socket_obj.send(data)
     except socket.timeout as e:
