@@ -149,6 +149,8 @@ class Controller(engine.ConnectionEventHandler):
         self.broadcast_prefix = "broadcast"
         self.group_request_prefix = "unicast"
         self.default_exchange = None
+        self.idle_timeout = 0
+        self.trace_protocol = False
         self._delay = 0
         # can't handle a request until the replies link is active, as
         # we need the peer assigned address, so need to delay any
@@ -161,8 +163,13 @@ class Controller(engine.ConnectionEventHandler):
     def _do_connect(self):
         """Establish connection and reply subscripion on processor thread."""
         hostname, port = self.hosts.current()
+        conn_props = {}
+        if self.idle_timeout:
+            conn_props["idle-time-out"] = float(self.idle_timeout)
+        conn_props["x-trace-protocol"] = self.trace_protocol
         self._socket_connection = self.processor.connect(hostname, port,
-                                                         handler=self)
+                                                         handler=self,
+                                                         properties=conn_props)
         self._connection = self._socket_connection.connection
         LOG.debug("Connection initiated")
 

@@ -45,8 +45,15 @@ proton_opts = [
 
     cfg.StrOpt('amqp_container_name',
                default='',
-               help='Name for the AMQP container')
+               help='Name for the AMQP container'),
 
+    cfg.IntOpt('amqp_idle_timeout',
+               default=0,  # disabled
+               help='Timeout for inactive connections (in seconds)'),
+
+    cfg.BoolOpt('amqp_trace',
+                default=False,
+                help='Debug: dump AMQP frames to stdout')
     # @todo: other options?
 ]
 
@@ -190,6 +197,8 @@ class ProtonDriver(base.BaseDriver):
         if conf.group_request_prefix:
             self._mgr.group_request_prefix = conf.group_request_prefix
         self._mgr.default_exchange = default_exchange
+        self._mgr.idle_timeout = conf.amqp_idle_timeout
+        self._mgr.trace_protocol = conf.amqp_trace
         self._mgr.connect()
 
     def send(self, target, ctxt, message,
