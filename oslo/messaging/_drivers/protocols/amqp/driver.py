@@ -53,7 +53,28 @@ proton_opts = [
 
     cfg.BoolOpt('amqp_trace',
                 default=False,
-                help='Debug: dump AMQP frames to stdout')
+                help='Debug: dump AMQP frames to stdout'),
+
+    cfg.StrOpt('ca_file',
+               default='',
+               help="CA certificate PEM file for verifing server certificate"),
+
+    cfg.StrOpt('cert_file',
+               default='',
+               help='Identifying certificate to present to clients'),
+
+    cfg.StrOpt('key_file',
+               default='',
+               help='Private key used to sign cert_file certificate'),
+
+    cfg.StrOpt('key_password',
+               default=None,
+               help='Password for decrypting key_file (if encrypted)'),
+
+    cfg.BoolOpt('allow_insecure_clients',
+                default=False,
+                help='Accept clients using either SSL or plain TCP')
+
     # @todo: other options?
 ]
 
@@ -186,7 +207,7 @@ class ProtonDriver(base.BaseDriver):
         base.BaseDriver.__init__(self, conf, url, default_exchange,
                                  allowed_remote_exmods)
         conf.register_opts(proton_opts)
-        # TODO(grs): handle ssl, authentication etc
+        # TODO(grs): handle authentication etc
         hosts = [(h.hostname, h.port or 5672) for h in url.hosts]
         cname = conf.amqp_container_name if conf.amqp_container_name else None
         self._mgr = controller.Controller(hosts, cname)
@@ -199,6 +220,14 @@ class ProtonDriver(base.BaseDriver):
         self._mgr.default_exchange = default_exchange
         self._mgr.idle_timeout = conf.amqp_idle_timeout
         self._mgr.trace_protocol = conf.amqp_trace
+
+        # SSL configuration
+        self._mgr.ssl_ca_file = conf.ca_file
+        self._mgr.ssl_cert_file = conf.cert_file
+        self._mgr.ssl_key_file = conf.key_file
+        self._mgr.ssl_key_password = conf.key_password
+        self._mgr.ssl_allow_insecure = conf.allow_insecure_clients
+
         self._mgr.connect()
 
     def send(self, target, ctxt, message,

@@ -20,11 +20,13 @@ __all__ = [
     "Connection"
 ]
 
-import logging, time
+import logging
+import time
 
 from link import ReceiverLink
 from link import SenderLink
 import proton
+
 
 LOG = logging.getLogger(__name__)
 
@@ -71,6 +73,54 @@ class Connection(object):
     EOS = -1   # indicates 'I/O stream closed'
 
     def __init__(self, container, name, eventHandler=None, properties={}):
+        """Create a new connection from the Container
+
+        The following AMQP connection properties are supported:
+
+        hostname: string, target host name sent in Open frame.
+
+        idle-time-out: float, time in seconds before an idle link will be
+        closed.
+
+        The following custom connection properties are supported:
+
+        x-trace-protocol: boolean, if true, dump sent and received frames to
+        stdout.
+
+        x-ssl-server: boolean, if True connection acts as a SSL server (default
+        False - use Client mode)
+
+        x-ssl-identity: tuple, contains identifying certificate information
+        which will be presented to the peer.  The first item in the tuple is
+        the path to the certificate file (PEM format).  The second item is the
+        path to a file containing the private key used to sign the certificate
+        (PEM format, optional if private key is stored in the certificate
+        itself). The last item is the password used to encrypt the private key
+        (string, not required if private key is not encrypted)
+
+        x-ssl-ca-file: string, path to a file containing the certificates of
+        the trusted Certificate Authorities that will be used to check the
+        signature of the peer's certificate.
+
+        x-ssl-verify-mode: string, configure the level of security provided by
+        SSL.  Possible values:
+            "verify-peer" (default) - most secure, requires peer to supply a
+            certificate signed by a valid CA (see x-ssl-ca-file), and check
+            the CN or SAN entry in the certificate against the expected
+            peer hostname (see x-ssl-peer-name)
+            "verify-cert" (default if no x-ssl-peer-name given) - like
+            verify-peer, but skips the check of the peer hostname.
+             Vulnerable to man-in-the-middle attack.
+            "no-verify" - do not require the peer to provide a certificate.
+            Results in a weaker encryption stream, and other vulnerabilities.
+
+        x-ssl-peer-name: string, DNS name of peer.  Required to authenticate
+        peer's certificate (see x-ssl-verify-mode).
+
+        x-ssl-allow-cleartext: boolean, Allows clients to connect without using
+        SSL (eg, plain TCP). Used by a server that will accept clients
+        requesting either trusted or untrusted connections.
+        """
         self._name = name
         self._container = container
         self._handler = eventHandler
@@ -98,6 +148,8 @@ class Connection(object):
         self._next_tick = 0
         self._user_context = None
         self._active = False
+
+        self._pn_ssl = self._configure_ssl(properties)
 
         # @todo sasl configuration and handling
         self._pn_sasl = None
@@ -134,6 +186,10 @@ class Connection(object):
         if not self._pn_sasl:
             self._pn_sasl = self._pn_transport.sasl()
         return self._pn_sasl
+
+    def pn_ssl(self):
+        """Return the Proton SSL context for this Connection."""
+        return self._pn_ssl
 
     def _get_user_context(self):
         return self._user_context
@@ -396,7 +452,6 @@ Associate an arbitrary user object with this Connection.
     def has_output(self):
         if self._write_done:
             return self.EOS
-
         try:
             pending = self._pn_transport.pending()
         except Exception as e:
@@ -530,3 +585,46 @@ Associate an arbitrary user object with this Connection.
             # report error during the next call to process()
             self._next_tick = time.time()
         return self.EOS
+
+    def _configure_ssl(self, properties):
+        verify_modes = {'verify-peer': proton.SSLDomain.VERIFY_PEER_NAME,
+                        'verify-cert': proton.SSLDomain.VERIFY_PEER,
+                        'no-verify': proton.SSLDomain.ANONYMOUS_PEER}
+
+        mode = proton.SSLDomain.MODE_CLIENT
+        if properties.get('x-ssl-server'):
+            mode = proton.SSLDomain.MODE_SERVER
+
+        identity = properties.get('x-ssl-identity')
+        ca_file = properties.get('x-ssl-ca-file')
+
+        if not identity and not ca_file:
+            return None  # SSL not configured
+
+        hostname = None
+        # This will throw proton.SSLUnavailable if SSL support is not installed
+        domain = proton.SSLDomain(mode)
+        if identity:
+            # our identity:
+            domain.set_credentials(identity[0], identity[1], identity[2])
+        if ca_file:
+            # how we verify peers:
+            domain.set_trusted_ca_db(ca_file)
+            hostname = properties.get('x-ssl-peer-name')
+            vdefault = 'verify-peer' if hostname else 'verify-cert'
+            vmode = verify_modes.get(properties.get('x-ssl-verify-mode',
+                                                    vdefault))
+            # check for configuration error
+            if not vmode:
+                raise proton.SSLException("bad value for x-ssl-verify-mode")
+            if vmode == proton.SSLDomain.VERIFY_PEER_NAME and not hostname:
+                raise proton.SSLException("verify-peer needs x-ssl-peer-name")
+            domain.set_peer_authentication(vmode, ca_file)
+        if mode == proton.SSLDomain.MODE_SERVER:
+            if properties.get('x-ssl-allow-cleartext'):
+                domain.allow_unsecured_client()
+        pn_ssl = proton.SSL(self._pn_transport, domain)
+        if hostname:
+            pn_ssl.peer_hostname = hostname
+        LOG.debug("SSL configured for connection %s" % self._name)
+        return pn_ssl

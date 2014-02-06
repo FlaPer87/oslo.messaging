@@ -151,6 +151,11 @@ class Controller(engine.ConnectionEventHandler):
         self.default_exchange = None
         self.idle_timeout = 0
         self.trace_protocol = False
+        self.ssl_ca_file = None
+        self.ssl_cert_file = None
+        self.ssl_key_file = None
+        self.ssl_key_password = None
+        self.ssl_allow_insecure = False
         self._delay = 0
         # can't handle a request until the replies link is active, as
         # we need the peer assigned address, so need to delay any
@@ -167,6 +172,17 @@ class Controller(engine.ConnectionEventHandler):
         if self.idle_timeout:
             conn_props["idle-time-out"] = float(self.idle_timeout)
         conn_props["x-trace-protocol"] = self.trace_protocol
+        if self.ssl_ca_file:
+            conn_props["x-ssl-ca-file"] = self.ssl_ca_file
+        if self.ssl_cert_file:
+            # assume this connection is for a server.  If client authentication
+            # support is developed, we'll need an explict flag (server or
+            # client)
+            conn_props["x-ssl-server"] = True
+            conn_props["x-ssl-identity"] = (self.ssl_cert_file,
+                                            self.ssl_key_file,
+                                            self.ssl_key_password)
+            conn_props["x-ssl-allow-cleartext"] = self.ssl_allow_insecure
         self._socket_connection = self.processor.connect(hostname, port,
                                                          handler=self,
                                                          properties=conn_props)
