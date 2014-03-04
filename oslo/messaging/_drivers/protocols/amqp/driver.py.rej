@@ -1,0 +1,59 @@
+--- oslo/messaging/_drivers/protocols/amqp/driver.py
++++ oslo/messaging/_drivers/protocols/amqp/driver.py
+@@ -198,33 +206,53 @@
+         if conf.group_request_prefix:
+             self._mgr.group_request_prefix = conf.group_request_prefix
+         self._mgr.default_exchange = default_exchange
+-        self._mgr.connect()
++        self._connected = False
++        self._lock = threading.Lock()
+ 
+     def send(self, target, ctxt, message,
+              wait_for_reply=None, timeout=None, envelope=False):
+         """Send a message to the given target."""
++        LOG.debug("Send to %s, (%s, %i)" % (target, wait_for_reply, timeout))
++        self._ensure_connected()
+         request = marshal_request(message, ctxt, envelope)
+         if timeout:
+             request.ttl = timeout
+         task = SendTask(target, request, wait_for_reply)
+         self._mgr.tasks().put(task)
+-        reply = task.get_reply(timeout)
+-        if reply:
++        if wait_for_reply:
++            reply = task.get_reply(timeout)
+             return unmarshal_response(reply, self._allowed_remote_exmods)
+         else:
+             return None
+ 
+     def send_notification(self, target, ctxt, message, version):
+         """Send a notification message to the given target."""
++        self._ensure_connected()
+         return self.send(target, ctxt, message, envelope=(version == 2.0))
+ 
+     def listen(self, target):
+         """Construct a Listener for the given target."""
+         LOG.debug("Listen to %s" % target)
++        self._ensure_connected()
+         listener = ProtonListener(self, target, self._mgr.tasks())
+         self._mgr.tasks().put(ListenTask(target, listener._incoming))
+         return listener
+ 
++    def _need_connect(self):
++        with self._lock:
++            if not self._connected:
++                self._connected = True
++                return True
++            else:
++                return False
++
++    def _ensure_connected(self):
++        # Cause manager to connect when first used. It is safe to push
++        # tasks to it whether connected or not, but those tasks won't
++        # be processed until connection completes.
++        if self._need_connect:
++            self._mgr.connect()
++
+     def cleanup(self):
+         """Release all resources."""
+         LOG.debug("Cleaning up ProtonDriver")
