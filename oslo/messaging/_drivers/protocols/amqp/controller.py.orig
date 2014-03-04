@@ -21,6 +21,9 @@ from six import moves
 from oslo.messaging._drivers.protocols.amqp import engine
 from oslo.messaging._drivers.protocols.amqp import eventloop
 
+# FIXME(markmc): remove this
+_ = lambda s: s
+
 LOG = logging.getLogger(__name__)
 
 
@@ -38,22 +41,20 @@ class Replies(engine.ReceiverEventHandler):
         return self._ready
 
     def prepare_for_response(self, request, reply_queue):
+        assert(self._ready)
         if reply_queue:
             request.id = uuid.uuid4().hex
             self._correlation[request.id] = reply_queue
             request.reply_to = self._receiver.source_address
-            LOG.debug("Reply for %s expected on %s" %
-                      (request.id, request.reply_to))
 
     def receiver_active(self, receiver_link):
         self._ready = True
         self._update_credit()
         self._on_ready()
-        LOG.debug("Replies expected on %s" % self._receiver.source_address)
 
     def receiver_remote_closed(self, receiver, error=None):
         # TODO(grs)
-        LOG.error("Reply subscription closed by peer: %s",
+        LOG.error(_("Reply subscription closed by peer: %s"),
                   (error or "no error given"))
 
     def message_received(self, receiver, message, handle):
@@ -68,7 +69,6 @@ class Replies(engine.ReceiverEventHandler):
             del self._correlation[key]
         else:
             LOG.warn("Can't correlate %s (%s)" % (key, self._correlation))
-        receiver.message_accepted(handle)
 
     def _update_credit(self):
         if self.capacity > self._credit:
@@ -92,7 +92,7 @@ class Server(engine.ReceiverEventHandler):
             self._receivers.append(r)
 
     def receiver_remote_closed(self, receiver, error=None):
-        text = "Server subscription %(addr)s closed by peer: %(err_msg)s"
+        text = _("Server subscription %(addr)s closed by peer: %(err_msg)s")
         vals = {
             "addr": receiver.source_address or receiver.target_address,
             "err_msg": error or "no error given"
@@ -102,8 +102,6 @@ class Server(engine.ReceiverEventHandler):
     def message_received(self, receiver, message, handle):
         receiver.add_capacity(1)
         self._incoming.put(message)
-        LOG.debug("message received: %s" % message)
-        receiver.message_accepted(handle)
 
 
 class Hosts(object):
@@ -140,8 +138,7 @@ class Hosts(object):
 
 class Controller(engine.ConnectionEventHandler):
     def __init__(self, hosts=None, container_name=None):
-        self.processor = None
-        self._container_name = container_name
+        self.processor = eventloop.Thread(container_name)
         self._tasks = moves.queue.Queue()
         self._senders = {}
         self._servers = {}
@@ -166,7 +163,6 @@ class Controller(engine.ConnectionEventHandler):
         self._replies = None
 
     def connect(self):
-        self.processor = eventloop.Thread(self._container_name)
         self.processor.wakeup(lambda: self._do_connect())
 
     def _do_connect(self):
@@ -175,8 +171,7 @@ class Controller(engine.ConnectionEventHandler):
         conn_props = {}
         if self.idle_timeout:
             conn_props["idle-time-out"] = float(self.idle_timeout)
-        if self.trace_protocol:
-            conn_props["x-trace-protocol"] = self.trace_protocol
+        conn_props["x-trace-protocol"] = self.trace_protocol
         if self.ssl_ca_file:
             conn_props["x-ssl-ca-file"] = self.ssl_ca_file
         if self.ssl_cert_file:
@@ -216,8 +211,7 @@ class Controller(engine.ConnectionEventHandler):
                 self._delay = min(d * 2, 60)
 
     def connection_active(self, connection):
-        h = self.hosts.current()
-        LOG.debug("Connection active (%s:%i), subscribing..." % h)
+        LOG.debug("Connection active, subscribing for replies")
         for s in self._servers.itervalues():
             s.attach(self._connection)
         self._replies = Replies(self._connection, lambda: self._ready())
@@ -231,6 +225,7 @@ class Controller(engine.ConnectionEventHandler):
 
     def _ready(self):
         LOG.info("Messaging is active (%s:%i)" % self.hosts.current())
+        LOG.debug("Reply subscription ready (%s)" % (self._tasks.empty()))
         if not self._tasks.empty():
             self.processor.wakeup(lambda: self._process_tasks())
 
@@ -246,7 +241,7 @@ class Controller(engine.ConnectionEventHandler):
             try:
                 self._tasks.get(False).execute(self)
             except Exception as e:
-                LOG.exception("Error processing task: %s", e)
+                LOG.error(_("Error processing task: %s"), str(e))
 
     def tasks(self):
         class Tasks(object):
@@ -265,31 +260,25 @@ class Controller(engine.ConnectionEventHandler):
         response to be put on the optional reply_queue if specified
         """
         address = self._resolve(target)
-        LOG.debug("Sending request for %s to %s" % (target, address))
         self._replies.prepare_for_response(request, reply_queue)
         self._send(address, request)
 
     def response(self, address, response):
-        LOG.debug("Sending response to %s" % address)
         self._send(address, response)
 
     def subscribe(self, target, requests):
+        LOG.debug("Subscribing to %s" % target)
+        assert(target.topic)
+        assert(target.server)
         addresses = [
             self._server_address(target),
             self._broadcast_address(target),
             self._group_request_address(target)
         ]
-        self._subscribe(target, addresses, requests)
-
-    def subscribe_notifications(self, target, requests):
-        addresses = [self._group_request_address(target)]
-        self._subscribe(target, addresses, requests)
-
-    def _subscribe(self, target, addresses, requests):
-        LOG.debug("Subscribing to %s (%s)" % (target, addresses))
         self._servers[target] = Server(self._connection, addresses, requests)
 
     def _resolve(self, target):
+        assert(target.topic)
         if target.server:
             return self._server_address(target)
         elif target.fanout:
@@ -297,8 +286,7 @@ class Controller(engine.ConnectionEventHandler):
         else:
             return self._group_request_address(target)
 
-    def _send(self, addr, message):
-        address = str(addr)
+    def _send(self, address, message):
         message.address = address
         self._sender(address).send(message)
 

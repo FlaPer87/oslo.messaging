@@ -28,6 +28,7 @@ __all__ = [
 ]
 
 from oslo.config import cfg
+import six
 from stevedore import driver
 
 from oslo.messaging import exceptions
@@ -97,6 +98,14 @@ class Transport(object):
                                            'topic and server names specified',
                                            target)
         return self._driver.listen(target)
+
+    def _listen_for_notifications(self, targets_and_priorities):
+        for target, priority in targets_and_priorities:
+            if not target.topic:
+                raise exceptions.InvalidTarget('A target must have '
+                                               'topic specified',
+                                               target)
+        return self._driver.listen_for_notifications(targets_and_priorities)
 
     def cleanup(self):
         """Release all resources associated with this transport."""
@@ -319,7 +328,7 @@ class TransportURL(object):
 
         Netloc is parsed following the sequence bellow:
 
-        * It is first splitted by ',' in order to support multiple hosts
+        * It is first split by ',' in order to support multiple hosts
         * The last parsed username and password will be propagated to the rest
           of hosts specified:
 
@@ -352,8 +361,7 @@ class TransportURL(object):
         if not url:
             return cls(conf, aliases=aliases)
 
-        # FIXME(flaper87): Not PY3K compliant
-        if not isinstance(url, basestring):
+        if not isinstance(url, six.string_types):
             raise InvalidTransportURL(url, 'Wrong URL type')
 
         url = urlutils.urlparse(url)

@@ -325,10 +325,12 @@ Associate an arbitrary user object with this Connection.
                 pn_link.context._active = True
                 if pn_link.is_sender:
                     sender_link = pn_link.context
+                    assert isinstance(sender_link, SenderLink)
                     if sender_link._handler:
                         sender_link._handler.sender_active(sender_link)
                 else:
                     receiver_link = pn_link.context
+                    assert isinstance(receiver_link, ReceiverLink)
                     if receiver_link._handler:
                         receiver_link._handler.receiver_active(receiver_link)
             pn_link = next_link
@@ -337,6 +339,7 @@ Associate an arbitrary user object with this Connection.
 
         pn_delivery = self._pn_connection.work_head
         while pn_delivery:
+            LOG.debug("Delivery updated!")
             next_delivery = pn_delivery.work_next
             if pn_delivery.link.context:
                 if pn_delivery.link.is_sender:

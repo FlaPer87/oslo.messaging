@@ -37,14 +37,16 @@ class IncomingMessage(object):
     def reply(self, reply=None, failure=None, log_failure=True):
         "Send a reply or failure back to the client."
 
+    def acknowledge(self):
+        "Acknowledge the message."
+
 
 @six.add_metaclass(abc.ABCMeta)
 class Listener(object):
 
-    def __init__(self, driver, target):
+    def __init__(self, driver):
         self.conf = driver.conf
         self.driver = driver
-        self.target = target
 
     @abc.abstractmethod
     def poll(self):
@@ -73,6 +75,12 @@ class BaseDriver(object):
     @abc.abstractmethod
     def listen(self, target):
         """Construct a Listener for the given target."""
+
+    @abc.abstractmethod
+    def listen_for_notifications(self, targets_and_priorities):
+        """Construct a notification Listener for the given list of
+        tuple of (target, priority).
+        """
 
     @abc.abstractmethod
     def cleanup(self):

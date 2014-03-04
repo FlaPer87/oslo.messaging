@@ -28,12 +28,12 @@ LOG = logging.getLogger(__name__)
 
 
 class ContainerEventHandler(object):
-    # @todo - ContainerEventHandler
+    # TODO(kgiusti) - ContainerEventHandler
     pass
 
 
-# An implementation of an AMQP 1.0 container
 class Container(object):
+    """An implementation of an AMQP 1.0 container."""
     def __init__(self, name, eventHandler=None, properties={}):
         self._name = name
         self._connections = {}

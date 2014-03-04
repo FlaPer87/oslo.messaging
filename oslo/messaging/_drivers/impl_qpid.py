@@ -18,15 +18,12 @@ import itertools
 import logging
 import time
 
-import eventlet
-import greenlet
 from oslo.config import cfg
 import six
 
 from oslo.messaging._drivers import amqp as rpc_amqp
 from oslo.messaging._drivers import amqpdriver
 from oslo.messaging._drivers import common as rpc_common
-from oslo.messaging.openstack.common import excutils
 from oslo.messaging.openstack.common import importutils
 from oslo.messaging.openstack.common import jsonutils
 
@@ -91,6 +88,17 @@ def raise_invalid_topology_version(conf):
     raise Exception(msg)
 
 
+class QpidMessage(dict):
+    def __init__(self, session, raw_message):
+        super(QpidMessage, self).__init__(
+            rpc_common.deserialize_msg(raw_message.content))
+        self._raw_message = raw_message
+        self._session = session
+
+    def acknowledge(self):
+        self._session.acknowledge(self._raw_message)
+
+
 class ConsumerBase(object):
     """Consumer base class."""
 
@@ -131,14 +139,13 @@ class ConsumerBase(object):
                     },
                 },
             }
-            if link_name:
-                addr_opts["link"]["name"] = link_name
             addr_opts["node"]["x-declare"].update(node_opts)
         elif conf.qpid_topology_version == 2:
             addr_opts = {
                 "link": {
                     "x-declare": {
                         "auto-delete": True,
+                        "exclusive": False,
                     },
                 },
             }
@@ -146,6 +153,8 @@ class ConsumerBase(object):
             raise_invalid_topology_version(conf)
 
         addr_opts["link"]["x-declare"].update(link_opts)
+        if link_name:
+            addr_opts["link"]["name"] = link_name
 
         self.address = "%s ; %s" % (node_name, jsonutils.dumps(addr_opts))
 
@@ -185,11 +194,9 @@ class ConsumerBase(object):
         message = self.receiver.fetch()
         try:
             self._unpack_json_msg(message)
-            msg = rpc_common.deserialize_msg(message.content)
-            self.callback(msg)
+            self.callback(QpidMessage(message))
         except Exception:
             LOG.exception(_("Failed to process message... skipping it."))
-        finally:
             self.session.acknowledge(message)
 
     def get_receiver(self):
@@ -219,14 +226,16 @@ class DirectConsumer(ConsumerBase):
         if conf.qpid_topology_version == 1:
             node_name = "%s/%s" % (msg_id, msg_id)
             node_opts = {"type": "direct"}
+            link_name = msg_id
         elif conf.qpid_topology_version == 2:
             node_name = "amq.direct/%s" % msg_id
             node_opts = {}
+            link_name = None
         else:
             raise_invalid_topology_version(conf)
 
         super(DirectConsumer, self).__init__(conf, session, callback,
-                                             node_name, node_opts, msg_id,
+                                             node_name, node_opts, link_name,
                                              link_opts)
 
 
@@ -444,8 +453,6 @@ class Connection(object):
         self.connection = None
         self.session = None
         self.consumers = {}
-        self.consumer_thread = None
-        self.proxy_callbacks = []
         self.conf = conf
 
         if server_params and 'hostname' in server_params:
@@ -463,6 +470,10 @@ class Connection(object):
         params.update(server_params or {})
 
         self.brokers = params['qpid_hosts']
+
+        brokers_count = len(self.brokers)
+        self.next_broker_indices = itertools.cycle(range(brokers_count))
+
         self.username = params['username']
         self.password = params['password']
         self.reconnect()
@@ -491,7 +502,6 @@ class Connection(object):
 
     def reconnect(self):
         """Handles reconnecting and re-establishing sessions and queues."""
-        attempt = 0
         delay = 1
         while True:
             # Close the session if necessary
@@ -501,8 +511,7 @@ class Connection(object):
                 except qpid_exceptions.ConnectionError:
                     pass
 
-            broker = self.brokers[attempt % len(self.brokers)]
-            attempt += 1
+            broker = self.brokers[next(self.next_broker_indices)]
 
             try:
                 self.connection_create(broker)
@@ -542,8 +551,6 @@ class Connection(object):
 
     def close(self):
         """Close/release this connection."""
-        self.cancel_consumer_thread()
-        self.wait_on_proxy_callbacks()
         try:
             self.connection.close()
         except Exception:
@@ -555,8 +562,6 @@ class Connection(object):
 
     def reset(self):
         """Reset a connection so it can be used again."""
-        self.cancel_consumer_thread()
-        self.wait_on_proxy_callbacks()
         self.session.close()
         self.session = self.connection.session()
         self.consumers = {}
@@ -600,21 +605,6 @@ class Connection(object):
             if limit and iteration >= limit:
                 raise StopIteration
             yield self.ensure(_error_callback, _consume)
-
-    def cancel_consumer_thread(self):
-        """Cancel a consumer thread."""
-        if self.consumer_thread is not None:
-            self.consumer_thread.kill()
-            try:
-                self.consumer_thread.wait()
-            except greenlet.GreenletExit:
-                pass
-            self.consumer_thread = None
-
-    def wait_on_proxy_callbacks(self):
-        """Wait for all proxy callback threads to exit."""
-        for proxy_cb in self.proxy_callbacks:
-            proxy_cb.wait()
 
     def publisher_send(self, cls, topic, msg):
         """Send to a publisher based on the publisher class."""
@@ -685,18 +675,6 @@ class Connection(object):
                 six.next(it)
             except StopIteration:
                 return
-
-    def consume_in_thread(self):
-        """Consumer from all queues/consumers in a greenthread."""
-        @excutils.forever_retry_uncaught_exceptions
-        def _consumer_thread():
-            try:
-                self.consume()
-            except greenlet.GreenletExit:
-                return
-        if self.consumer_thread is None:
-            self.consumer_thread = eventlet.spawn(_consumer_thread)
-        return self.consumer_thread
 
 
 class QpidDriver(amqpdriver.AMQPDriverBase):

@@ -15,7 +15,6 @@
 
 import abc
 import logging
-import threading
 
 from six import moves
 
@@ -25,6 +24,9 @@ from oslo.messaging._drivers import common
 from oslo.messaging._drivers.protocols.amqp import controller
 from oslo.messaging.openstack.common import importutils
 from oslo.messaging.openstack.common import jsonutils
+
+# FIXME(markmc): remove this
+_ = lambda s: s
 
 proton = importutils.try_import("proton")
 
@@ -53,25 +55,27 @@ proton_opts = [
                 default=False,
                 help='Debug: dump AMQP frames to stdout'),
 
-    cfg.StrOpt('proton_ca_file',
+    cfg.StrOpt('ca_file',
                default='',
                help="CA certificate PEM file for verifing server certificate"),
 
-    cfg.StrOpt('proton_cert_file',
+    cfg.StrOpt('cert_file',
                default='',
                help='Identifying certificate to present to clients'),
 
-    cfg.StrOpt('proton_key_file',
+    cfg.StrOpt('key_file',
                default='',
                help='Private key used to sign cert_file certificate'),
 
-    cfg.StrOpt('proton_key_password',
+    cfg.StrOpt('key_password',
                default=None,
                help='Password for decrypting key_file (if encrypted)'),
 
     cfg.BoolOpt('allow_insecure_clients',
                 default=False,
                 help='Accept clients using either SSL or plain TCP')
+
+    # @todo: other options?
 ]
 
 
@@ -102,16 +106,12 @@ class SendTask(Task):
 
 
 class ListenTask(Task):
-    def __init__(self, target, incoming, notifications=False):
+    def __init__(self, target, request_queue):
         self._target = target
-        self._incoming = incoming
-        self._notifications = notifications
+        self._request_queue = request_queue
 
     def execute(self, manager):
-        if self._notifications:
-            manager.subscribe_notifications(self._target, self._incoming)
-        else:
-            manager.subscribe(self._target, self._incoming)
+        manager.subscribe(self._target, self._request_queue)
 
 
 class ReplyTask(Task):
@@ -179,27 +179,21 @@ class ProtonIncomingMessage(base.IncomingMessage):
         self._correlation_id = message.id
 
     def reply(self, reply=None, failure=None, log_failure=True):
-        if self._reply_to:
-            response = marshal_response(reply=reply, failure=failure)
-            if self._correlation_id:
-                response.correlation_id = self._correlation_id
-            LOG.debug("Replying to %s" % self._correlation_id)
-            task = ReplyTask(self._reply_to, response, log_failure)
-            self._task_queue.put(task)
-        else:
-            LOG.warn("Ignoring reply as no reply address available")
+        response = marshal_response(reply=reply, failure=failure)
+        if self._correlation_id:
+            response.correlation_id = self._correlation_id
+        self._task_queue.put(ReplyTask(self._reply_to, response, log_failure))
 
 
 class ProtonListener(base.Listener):
-    def __init__(self, driver, tasks):
-        base.Listener.__init__(self, driver)
+    def __init__(self, driver, target, tasks):
+        base.Listener.__init__(self, driver, target)
         self._tasks = tasks
         self._incoming = moves.queue.Queue()
 
     def poll(self):
         message = self._incoming.get()
         request, ctxt = unmarshal_request(message)
-        LOG.debug("Returning incoming message")
         return ProtonIncomingMessage(self, ctxt, request, self._tasks, message)
 
     def incoming(self):
@@ -228,70 +222,38 @@ class ProtonDriver(base.BaseDriver):
         self._mgr.trace_protocol = conf.amqp_trace
 
         # SSL configuration
-        self._mgr.ssl_ca_file = conf.proton_ca_file
-        self._mgr.ssl_cert_file = conf.proton_cert_file
-        self._mgr.ssl_key_file = conf.proton_key_file
-        self._mgr.ssl_key_password = conf.proton_key_password
+        self._mgr.ssl_ca_file = conf.ca_file
+        self._mgr.ssl_cert_file = conf.cert_file
+        self._mgr.ssl_key_file = conf.key_file
+        self._mgr.ssl_key_password = conf.key_password
         self._mgr.ssl_allow_insecure = conf.allow_insecure_clients
 
-        self._connected = False
-        self._lock = threading.Lock()
+        self._mgr.connect()
 
     def send(self, target, ctxt, message,
              wait_for_reply=None, timeout=None, envelope=False):
         """Send a message to the given target."""
-        self._ensure_connected()
         request = marshal_request(message, ctxt, envelope)
         if timeout:
             request.ttl = timeout
         task = SendTask(target, request, wait_for_reply)
         self._mgr.tasks().put(task)
-        if wait_for_reply:
-            LOG.debug("Send to %s, response expected" % target)
-            reply = task.get_reply(timeout)
-            result = unmarshal_response(reply, self._allowed_remote_exmods)
-            LOG.debug("Send to %s returning" % target)
-            return result
+        reply = task.get_reply(timeout)
+        if reply:
+            return unmarshal_response(reply, self._allowed_remote_exmods)
         else:
-            LOG.debug("Send to %s, no response expected" % target)
             return None
 
     def send_notification(self, target, ctxt, message, version):
         """Send a notification message to the given target."""
-        self._ensure_connected()
         return self.send(target, ctxt, message, envelope=(version == 2.0))
 
     def listen(self, target):
         """Construct a Listener for the given target."""
         LOG.debug("Listen to %s" % target)
-        self._ensure_connected()
-        listener = ProtonListener(self, self._mgr.tasks())
+        listener = ProtonListener(self, target, self._mgr.tasks())
         self._mgr.tasks().put(ListenTask(target, listener._incoming))
         return listener
-
-    def listen_for_notifications(self, targets_and_priorities):
-        LOG.debug("Listen for notifications %s" % targets_and_priorities)
-        self._ensure_connected()
-        listener = ProtonListener(self, self._mgr.tasks())
-        for target, priority in targets_and_priorities:
-            target.topic = '%s.%s' % (target.topic, priority)
-            self._mgr.tasks().put(ListenTask(target, listener._incoming, True))
-        return listener
-
-    def _need_connect(self):
-        with self._lock:
-            if not self._connected:
-                self._connected = True
-                return True
-            else:
-                return False
-
-    def _ensure_connected(self):
-        # Cause manager to connect when first used. It is safe to push
-        # tasks to it whether connected or not, but those tasks won't
-        # be processed until connection completes.
-        if self._need_connect():
-            self._mgr.connect()
 
     def cleanup(self):
         """Release all resources."""

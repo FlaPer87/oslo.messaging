@@ -40,7 +40,7 @@ class _Link(object):
         self._properties = properties
         self._user_context = None
         self._active = False
-        # @todo: raise jira to add 'context' attr to api
+        # TODO(kgiusti): raise jira to add 'context' attr to api
         self._pn_link = pn_link
         pn_link.context = self
 
@@ -59,14 +59,13 @@ class _Link(object):
         desired_mode = properties.get("distribution-mode")
         if desired_mode:
             if desired_mode == "copy":
-                self._pn_link.source.distribution_mode = \
-                    proton.Terminus.DIST_MODE_COPY
+                mode = proton.Terminus.DIST_MODE_COPY
             elif desired_mode == "move":
-                self._pn_link.source.distribution_mode = \
-                    proton.Terminus.DIST_MODE_MOVE
+                mode = proton.Terminus.DIST_MODE_MOVE
             else:
                 raise Exception("Unknown distribution mode: %s" %
                                 str(desired_mode))
+            self._pn_link.source.distribution_mode = mode
 
     @property
     def name(self):
@@ -81,16 +80,15 @@ class _Link(object):
     def _set_user_context(self, ctxt):
         self._user_context = ctxt
 
+    _uc_docstr = """Arbitrary application object associated with this link."""
     user_context = property(_get_user_context, _set_user_context,
-                            doc="""
-Associate an arbitrary application object with this link.
-""")
+                            doc=_uc_docstr)
 
     @property
     def source_address(self):
-        """If link is a sender, source is determined by the local value, else
-        use the remote.
-        """
+        """Return the authorative source of the link."""
+        # If link is a sender, source is determined by the local
+        # value, else use the remote.
         if self._pn_link.is_sender:
             return self._pn_link.source.address
         else:
@@ -98,9 +96,9 @@ Associate an arbitrary application object with this link.
 
     @property
     def target_address(self):
-        """If link is a receiver, target is determined by the local value, else
-        use the remote.
-        """
+        """Return the authorative target of the link."""
+        # If link is a receiver, target is determined by the local
+        # value, else use the remote.
         if self._pn_link.is_receiver:
             return self._pn_link.target.address
         else:
@@ -155,13 +153,13 @@ class SenderLink(_Link):
         self._next_deadline = 0
         self._next_tag = 0
 
-        # @todo - think about send-settle-mode configuration
+        # TODO(kgiusti) - think about send-settle-mode configuration
 
     def send(self, message, delivery_callback=None,
              handle=None, deadline=None):
         self._pending_sends.append((message, delivery_callback, handle,
                                    deadline))
-        # @todo deadline not supported yet
+        # TODO(kgiusti) deadline not supported yet
         assert not deadline, "send timeout not supported yet!"
         if deadline and (self._next_deadline == 0 or
                          self._next_deadline > deadline):
@@ -272,7 +270,7 @@ class ReceiverLink(_Link):
         self._next_handle = 0
         self._unsettled_deliveries = {}  # indexed by handle
 
-        # @todo - think about receiver-settle-mode configuration
+        # TODO(kgiusti) - think about receiver-settle-mode configuration
 
     def capacity(self):
         return self._pn_link.credit()
@@ -284,7 +282,7 @@ class ReceiverLink(_Link):
         self._settle_delivery(handle, proton.Delivery.ACCEPTED)
 
     def message_rejected(self, handle, reason=None):
-        # @todo: how to deal with 'reason'
+        # TODO(kgiusti): how to deal with 'reason'
         self._settle_delivery(handle, proton.Delivery.REJECTED)
 
     def message_released(self, handle):
@@ -300,7 +298,7 @@ class ReceiverLink(_Link):
 
     def _delivery_updated(self, delivery):
         # a receive delivery changed state
-        # @todo: multi-frame message transfer
+        # TODO(kgiusti): multi-frame message transfer
         LOG.debug("Receive delivery updated")
         if delivery.readable:
             data = self._pn_link.recv(delivery.pending)
@@ -314,7 +312,7 @@ class ReceiverLink(_Link):
                 self._unsettled_deliveries[handle] = delivery
                 self._handler.message_received(self, msg, handle)
             else:
-                # @todo: is it ok to assume Delivery.REJECTED?
+                # TODO(kgiusti): is it ok to assume Delivery.REJECTED?
                 delivery.settle()
 
     def _settle_delivery(self, handle, result):

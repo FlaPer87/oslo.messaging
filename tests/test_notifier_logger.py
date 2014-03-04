@@ -12,9 +12,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
 import logging
 import logging.config
 import os
+import sys
+try:
+    import threading
+except ImportError:
+    threading = None
 
 import mock
 import testscenarios
@@ -33,6 +39,13 @@ logging.AUDIT = logging.INFO + 1
 logging.addLevelName(logging.AUDIT, 'AUDIT')
 
 
+def get_thread_ident():
+    if threading is not None:
+        return threading.current_thread().ident
+    else:
+        return None
+
+
 class TestLogNotifier(test_utils.BaseTestCase):
 
     scenarios = [
@@ -47,16 +60,16 @@ class TestLogNotifier(test_utils.BaseTestCase):
 
     def setUp(self):
         super(TestLogNotifier, self).setUp()
-        self.addCleanup(timeutils.clear_time_override)
         self.addCleanup(messaging.notify._impl_test.reset)
         self.config(notification_driver=['test'])
 
-    def test_logger(self):
+    @mock.patch('oslo.messaging.openstack.common.timeutils.utcnow')
+    def test_logger(self, mock_utcnow):
         with mock.patch('oslo.messaging.transport.get_transport',
                         return_value=test_notifier._FakeTransport(self.conf)):
             self.logger = messaging.LoggingNotificationHandler('test://')
 
-        timeutils.set_time_override()
+        mock_utcnow.return_value = datetime.datetime.utcnow()
 
         levelno = getattr(logging, self.priority.upper(), 42)
 
@@ -74,14 +87,14 @@ class TestLogNotifier(test_utils.BaseTestCase):
         self.assertEqual(n['priority'],
                          getattr(self, 'queue', self.priority.upper()))
         self.assertEqual(n['event_type'], 'logrecord')
-        self.assertEqual(n['timestamp'], str(timeutils.utcnow.override_time))
+        self.assertEqual(n['timestamp'], str(timeutils.utcnow()))
         self.assertEqual(n['publisher_id'], None)
         self.assertEqual(
             n['payload'],
             {'process': os.getpid(),
              'funcName': None,
              'name': 'foo',
-             'thread': logging.thread.get_ident() if logging.thread else None,
+             'thread': get_thread_ident(),
              'levelno': levelno,
              'processName': 'MainProcess',
              'pathname': '/foo/bar',
@@ -93,7 +106,8 @@ class TestLogNotifier(test_utils.BaseTestCase):
 
     @testtools.skipUnless(hasattr(logging.config, 'dictConfig'),
                           "Need logging.config.dictConfig (Python >= 2.7)")
-    def test_logging_conf(self):
+    @mock.patch('oslo.messaging.openstack.common.timeutils.utcnow')
+    def test_logging_conf(self, mock_utcnow):
         with mock.patch('oslo.messaging.transport.get_transport',
                         return_value=test_notifier._FakeTransport(self.conf)):
             logging.config.dictConfig({
@@ -113,29 +127,33 @@ class TestLogNotifier(test_utils.BaseTestCase):
                 },
             })
 
-        timeutils.set_time_override()
+        mock_utcnow.return_value = datetime.datetime.utcnow()
 
         levelno = getattr(logging, self.priority.upper())
 
         logger = logging.getLogger('default')
+        lineno = sys._getframe().f_lineno + 1
         logger.log(levelno, 'foobar')
 
         n = messaging.notify._impl_test.NOTIFICATIONS[0][1]
         self.assertEqual(n['priority'],
                          getattr(self, 'queue', self.priority.upper()))
         self.assertEqual(n['event_type'], 'logrecord')
-        self.assertEqual(n['timestamp'], str(timeutils.utcnow.override_time))
+        self.assertEqual(n['timestamp'], str(timeutils.utcnow()))
         self.assertEqual(n['publisher_id'], None)
+        pathname = __file__
+        if pathname.endswith(('.pyc', '.pyo')):
+            pathname = pathname[:-1]
         self.assertDictEqual(
             n['payload'],
             {'process': os.getpid(),
              'funcName': 'test_logging_conf',
              'name': 'default',
-             'thread': logging.thread.get_ident() if logging.thread else None,
+             'thread': get_thread_ident(),
              'levelno': levelno,
              'processName': 'MainProcess',
-             'pathname': __file__[:-1],  # Remove the 'c' of .pyc
-             'lineno': 121,
+             'pathname': pathname,
+             'lineno': lineno,
              'msg': 'foobar',
              'exc_info': None,
              'levelname': logging.getLevelName(levelno),

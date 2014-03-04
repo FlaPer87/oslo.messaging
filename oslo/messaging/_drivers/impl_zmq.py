@@ -846,8 +846,8 @@ class ZmqIncomingMessage(base.IncomingMessage):
 
 class ZmqListener(base.Listener):
 
-    def __init__(self, driver, target):
-        super(ZmqListener, self).__init__(driver, target)
+    def __init__(self, driver):
+        super(ZmqListener, self).__init__(driver)
         self.incoming_queue = moves.queue.Queue()
 
     def dispatch(self, ctxt, version, method, namespace, **kwargs):
@@ -948,13 +948,27 @@ class ZmqDriver(base.BaseDriver):
     def listen(self, target):
         conn = create_connection(self.conf)
 
-        listener = ZmqListener(self, target)
+        listener = ZmqListener(self)
 
         conn.create_consumer(target.topic, listener)
         conn.create_consumer('%s.%s' % (target.topic, target.server),
                              listener)
         conn.create_consumer(target.topic, listener, fanout=True)
 
+        conn.consume_in_thread()
+
+        return listener
+
+    def listen_for_notifications(self, targets_and_priorities):
+        conn = create_connection(self.conf)
+
+        listener = ZmqListener(self, None)
+        for target, priority in targets_and_priorities:
+            # NOTE(ewindisch): dot-priority in rpc notifier does not
+            # work with our assumptions.
+            # NOTE(sileht): create_consumer doesn't support target.exchange
+            conn.create_consumer('%s-%s' % (target.topic, priority),
+                                 listener)
         conn.consume_in_thread()
 
         return listener

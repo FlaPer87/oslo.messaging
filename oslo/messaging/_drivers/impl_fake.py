@@ -26,7 +26,6 @@ from oslo.messaging._drivers import base
 
 
 class FakeIncomingMessage(base.IncomingMessage):
-
     def __init__(self, listener, ctxt, message, reply_q):
         super(FakeIncomingMessage, self).__init__(listener, ctxt, message)
         self._reply_q = reply_q
@@ -39,15 +38,19 @@ class FakeIncomingMessage(base.IncomingMessage):
 
 class FakeListener(base.Listener):
 
-    def __init__(self, driver, target, exchange):
-        super(FakeListener, self).__init__(driver, target)
+    def __init__(self, driver, exchange, targets):
+        super(FakeListener, self).__init__(driver)
         self._exchange = exchange
+        self._targets = targets
 
     def poll(self):
         while True:
-            (ctxt, message, reply_q) = self._exchange.poll(self.target)
-            if message is not None:
-                return FakeIncomingMessage(self, ctxt, message, reply_q)
+            for target in self._targets:
+                (ctxt, message, reply_q) = self._exchange.poll(target)
+                if message is not None:
+                    message = FakeIncomingMessage(self, ctxt, message, reply_q)
+                    message.acknowledge()
+                    return message
             time.sleep(.05)
 
 
@@ -80,8 +83,9 @@ class FakeExchange(object):
 
     def poll(self, target):
         with self._queues_lock:
-            queue = self._get_server_queue(target.topic, target.server)
-            if not queue:
+            if target.server:
+                queue = self._get_server_queue(target.topic, target.server)
+            else:
                 queue = self._get_topic_queue(target.topic)
             return queue.pop(0) if queue else (None, None, None)
 
@@ -152,7 +156,21 @@ class FakeDriver(base.BaseDriver):
         exchange = self._get_exchange(target.exchange or
                                       self._default_exchange)
 
-        return FakeListener(self, target, exchange)
+        listener = FakeListener(self, exchange,
+                                [messaging.Target(topic=target.topic,
+                                                  server=target.server),
+                                 messaging.Target(topic=target.topic)])
+        return listener
+
+    def listen_for_notifications(self, targets_and_priorities):
+        # TODO(sileht): Handle the target.exchange
+        exchange = self._get_exchange(self._default_exchange)
+
+        targets = [messaging.Target(topic='%s.%s' % (target.topic, priority))
+                   for target, priority in targets_and_priorities]
+        listener = FakeListener(self, exchange, targets)
+
+        return listener
 
     def cleanup(self):
         pass

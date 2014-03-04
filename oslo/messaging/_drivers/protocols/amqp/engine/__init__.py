@@ -16,7 +16,8 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-from container import *
-from connection import *
-from link import *
-from sockets import *
+from container import Container, ContainerEventHandler
+from connection import Connection, ConnectionEventHandler
+from link import ReceiverLink, SenderLink, ReceiverEventHandler, SenderEventHandler
+from sockets import read_socket_input as do_input
+from sockets import write_socket_output as do_output

@@ -27,9 +27,6 @@ from six import moves
 
 from oslo.messaging._drivers.protocols.amqp import engine
 
-# FIXME(markmc): remove this
-_ = lambda s: s
-
 LOG = logging.getLogger(__name__)
 
 
@@ -54,27 +51,39 @@ class _SocketConnection():
 
     def read(self):
         """Called when socket is read-ready."""
-        try:
-            rc = engine.sockets.read_socket_input(self.connection,
-                                                  self.socket)
-        except Exception as e:
-            rc = engine.Connection.EOS
-            self._handler.connection_failed(self.connection, str(e))
-        if rc > 0:
-            self.connection.process(time.time())
-        return rc
+        while True:
+            try:
+                rc = engine.do_input(self.connection, self.socket)
+                if rc > 0:
+                    self.connection.process(time.time())
+                return rc
+            except socket.error as e:
+                err = e.args[0]
+                if err == errno.EAGAIN or err == errno.EINTR:
+                    continue
+                elif err == errno.EWOULDBLOCK:
+                    return 0
+                else:
+                    self._handler.connection_failed(self.connection, e)
+                    return engine.Connection.EOS
 
     def write(self):
         """Called when socket is write-ready."""
-        try:
-            rc = engine.sockets.write_socket_output(self.connection,
-                                                    self.socket)
-        except Exception as e:
-            rc = engine.Connection.EOS
-            self._handler.connection_failed(self.connection, str(e))
-        if rc > 0:
-            self.connection.process(time.time())
-        return rc
+        while True:
+            try:
+                rc = engine.do_output(self.connection, self.socket)
+                if rc > 0:
+                    self.connection.process(time.time())
+                return rc
+            except socket.error as e:
+                err = e.args[0]
+                if err == errno.EAGAIN or err == errno.EINTR:
+                    continue
+                elif err == errno.EWOULDBLOCK:
+                    return 0
+                else:
+                    self._handler.connection_failed(self.connection, e)
+                    return engine.Connection.EOS
 
     def connect(self, hostname, port, sasl_mechanisms="ANONYMOUS"):
         addr = socket.getaddrinfo(hostname, port,
@@ -98,7 +107,7 @@ class _SocketConnection():
         if sasl_mechanisms:
             pn_sasl = self.connection.sasl
             pn_sasl.mechanisms(sasl_mechanisms)
-            # @todo KAG: server if accepting inbound connections
+            # TODO(kgiusti): server if accepting inbound connections
             pn_sasl.client()
         self.connection.open()
 
@@ -117,8 +126,6 @@ class Schedule(object):
         self._entries = []
 
     def schedule(self, request, delay):
-        assert request
-        assert delay
         entry = (time.time() + delay, request)
         heapq.heappush(self._entries, entry)
 
@@ -206,7 +213,6 @@ class Thread(threading.Thread):
         # return pre-existing
         conn = self._container.get_connection(key)
         if conn:
-            assert isinstance(conn.user_context, _SocketConnection)
             return conn.user_context
 
         # create a new connection - this will be stored in the
@@ -219,7 +225,7 @@ class Thread(threading.Thread):
 
     def run(self):
         """Run the proton event/timer loop."""
-        LOG.debug(_("Starting Proton thread, container=%s"),
+        LOG.debug("Starting Proton thread, container=%s",
                   self._container.name)
 
         while not self._shutdown:
@@ -239,13 +245,8 @@ class Thread(threading.Thread):
 
             timeout = self._schedule.timeout(timeout)
 
-            LOG.debug(_("proton thread select() call (timeout=%s)"),
-                      str(timeout))
-            readable, writable, ignore = select.select(readfds,
-                                                       writefds,
-                                                       [],
-                                                       timeout)
-            LOG.debug(_("select() returned"))
+            results = select.select(readfds, writefds, [], timeout)
+            readable, writable, ignore = results
 
             for r in readable:
                 r.read()
@@ -259,7 +260,7 @@ class Thread(threading.Thread):
             for w in writable:
                 w.write()
 
-        LOG.debug(_("Stopping Proton thread, container=%s"),
+        LOG.debug("Stopping Proton thread, container=%s",
                   self._container.name)
         # abort any requests. Setting the lists to None here prevents further
         # requests from being created
