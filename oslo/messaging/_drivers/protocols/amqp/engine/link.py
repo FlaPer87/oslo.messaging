@@ -56,16 +56,17 @@ class _Link(object):
         elif source_address:
             self._pn_link.source.address = source_address
 
-        desired_mode = properties.get("distribution-mode")
-        if desired_mode:
-            if desired_mode == "copy":
-                mode = proton.Terminus.DIST_MODE_COPY
-            elif desired_mode == "move":
-                mode = proton.Terminus.DIST_MODE_MOVE
-            else:
-                raise Exception("Unknown distribution mode: %s" %
-                                str(desired_mode))
-            self._pn_link.source.distribution_mode = mode
+        if properties:
+            desired_mode = properties.get("distribution-mode")
+            if desired_mode:
+                if desired_mode == "copy":
+                    mode = proton.Terminus.DIST_MODE_COPY
+                elif desired_mode == "move":
+                    mode = proton.Terminus.DIST_MODE_MOVE
+                else:
+                    raise Exception("Unknown distribution mode: %s" %
+                                    str(desired_mode))
+                self._pn_link.source.distribution_mode = mode
 
     @property
     def name(self):
@@ -114,10 +115,12 @@ class _Link(object):
                          | proton.Endpoint.REMOTE_CLOSED)
 
     def destroy(self):
-        LOG.debug("link destroyed %s" % str(self._pn_link))
+        LOG.debug("link destroyed %s", str(self._pn_link))
         self._user_context = None
-        self._pn_link.context = None
-        self._pn_link = None
+        if self._pn_link:
+            self._pn_link.context = None
+            # self._pn_link.free()  # TODO(kgiusti) Proton 0.7
+            self._pn_link = None
 
 
 class SenderEventHandler(object):
@@ -144,10 +147,10 @@ class SenderLink(_Link):
     MODIFIED = 4
 
     def __init__(self, connection, pn_link, source_address,
-                 target_address, eventHandler, properties):
+                 target_address, event_handler, properties):
         super(SenderLink, self).__init__(connection, pn_link,
                                          target_address, source_address,
-                                         eventHandler, properties)
+                                         event_handler, properties)
         self._pending_sends = collections.deque()
         self._pending_acks = {}
         self._next_deadline = 0
@@ -263,10 +266,10 @@ class ReceiverEventHandler(object):
 
 class ReceiverLink(_Link):
     def __init__(self, connection, pn_link, target_address,
-                 source_address, eventHandler, properties):
+                 source_address, event_handler, properties):
         super(ReceiverLink, self).__init__(connection, pn_link,
                                            target_address, source_address,
-                                           eventHandler, properties)
+                                           event_handler, properties)
         self._next_handle = 0
         self._unsettled_deliveries = {}  # indexed by handle
 
@@ -291,7 +294,7 @@ class ReceiverLink(_Link):
     def message_modified(self, handle):
         self._settle_delivery(handle, proton.Delivery.MODIFIED)
 
-    def destroy(self, error=None):
+    def destroy(self):
         self._connection._remove_receiver(self._name)
         self._connection = None
         super(ReceiverLink, self).destroy()

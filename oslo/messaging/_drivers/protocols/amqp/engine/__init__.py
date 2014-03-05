@@ -18,6 +18,7 @@
 #
 from container import Container, ContainerEventHandler
 from connection import Connection, ConnectionEventHandler
-from link import ReceiverLink, SenderLink, ReceiverEventHandler, SenderEventHandler
+from link import ReceiverLink, ReceiverEventHandler
+from link import SenderLink, SenderEventHandler
 from sockets import read_socket_input as do_input
 from sockets import write_socket_output as do_output

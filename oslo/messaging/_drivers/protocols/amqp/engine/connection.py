@@ -39,40 +39,46 @@ class ConnectionEventHandler(object):
 
     def connection_failed(self, connection, error):
         """Connection's transport has failed in some way."""
-        LOG.warn("connection_failed, error=%s (ignored)" % str(error))
+        LOG.warn("connection_failed, error=%s (ignored)", str(error))
 
     def connection_remote_closed(self, connection, error=None):
+        """Peer has closed its end of the connection."""
         LOG.debug("connection_remote_closed (ignored)")
 
     def connection_closed(self, connection):
+        """The connection has cleanly closed."""
         LOG.debug("connection_closed (ignored)")
 
     def sender_requested(self, connection, link_handle,
                          name, requested_source,
-                         properties={}):
+                         properties=None):
+        """Peer has requested a SenderLink be created."""
         # call accept_sender to accept new link,
         # reject_sender to reject it.
         LOG.debug("sender_requested (ignored)")
 
     def receiver_requested(self, connection, link_handle,
                            name, requested_target,
-                           properties={}):
-        # call accept_sender to accept new link,
-        # reject_sender to reject it.
+                           properties):
+        """Peer has requested a ReceiverLink be created."""
+        # call accept_receiver to accept new link,
+        # reject_receiver to reject it.
         LOG.debug("receiver_requested (ignored)")
 
-    # @todo cleaner sasl support, esp. server side
+    # TODO(kgiusti) cleaner sasl support, esp. server side
     def sasl_step(self, connection, pn_sasl):
+        """SASL exchange occurred."""
         LOG.debug("sasl_step (ignored)")
 
     def sasl_done(self, connection, result):
+        """SASL exchange complete."""
         LOG.debug("sasl_done (ignored)")
 
-
 class Connection(object):
+    """A Connection to a peer."""
     EOS = -1   # indicates 'I/O stream closed'
 
-    def __init__(self, container, name, eventHandler=None, properties={}):
+    def __init__(self, container, name, event_handler=None, properties=None):
         """Create a new connection from the Container
 
         The following AMQP connection properties are supported:
@@ -123,20 +129,22 @@ class Connection(object):
         """
         self._name = name
         self._container = container
-        self._handler = eventHandler
+        self._handler = event_handler
 
         self._pn_connection = proton.Connection()
         self._pn_connection.container = container.name
-        if 'hostname' in properties:
-            self._pn_connection.hostname = properties['hostname']
-
         self._pn_transport = proton.Transport()
         self._pn_transport.bind(self._pn_connection)
-        secs = properties.get("idle-time-out")
-        if secs:
-            self._pn_transport.idle_timeout = secs
-        if properties.get("x-trace-protocol"):
-            self._pn_transport.trace(proton.Transport.TRACE_FRM)
+        self._pn_session = None
+
+        if properties:
+            if 'hostname' in properties:
+                self._pn_connection.hostname = properties['hostname']
+            secs = properties.get("idle-time-out")
+            if secs:
+                self._pn_transport.idle_timeout = secs
+            if properties.get("x-trace-protocol"):
+                self._pn_transport.trace(proton.Transport.TRACE_FRM)
 
         # indexed by link-name
         self._sender_links = {}    # SenderLink or pn_link if pending
@@ -151,7 +159,7 @@ class Connection(object):
 
         self._pn_ssl = self._configure_ssl(properties)
 
-        # @todo sasl configuration and handling
+        # TODO(kgiusti) sasl configuration and handling
         self._pn_sasl = None
         self._sasl_done = False
 
@@ -160,12 +168,12 @@ class Connection(object):
         return self._container
 
     @property
-    # @todo - hopefully remove
+    # TODO(kgiusti) - hopefully remove
     def pn_transport(self):
         return self._pn_transport
 
     @property
-    # @todo - hopefully remove
+    # TODO(kgiusti) - hopefully remove
     def pn_connection(self):
         return self._pn_connection
 
@@ -181,7 +189,7 @@ class Connection(object):
         return self._pn_connection.remote_container
 
     @property
-    # @todo - think about server side use of sasl!
+    # TODO(kgiusti) - think about server side use of sasl!
     def sasl(self):
         if not self._pn_sasl:
             self._pn_sasl = self._pn_transport.sasl()
@@ -197,10 +205,9 @@ class Connection(object):
     def _set_user_context(self, ctxt):
         self._user_context = ctxt
 
+    _uc_docstr = """Associate an arbitrary user object with this Connection."""
     user_context = property(_get_user_context, _set_user_context,
-                            doc="""
-Associate an arbitrary user object with this Connection.
-""")
+                            doc=_uc_docstr)
 
     def open(self):
         self._pn_connection.open()
@@ -208,10 +215,10 @@ Associate an arbitrary user object with this Connection.
         self._pn_session.open()
 
     def close(self, error=None):
-        for l in self._sender_links.itervalues():
-            l.close(error)
-        for l in self._receiver_links.itervalues():
-            l.close(error)
+        for link in self._sender_links.itervalues():
+            link.close(error)
+        for link in self._receiver_links.itervalues():
+            link.close(error)
         self._pn_session.close()
         self._pn_connection.close()
 
@@ -237,7 +244,7 @@ Associate an arbitrary user object with this Connection.
         if pn_link.is_sender and pn_link.name not in self._sender_links:
             LOG.debug("Remotely initiated Sender needs init")
             self._sender_links[pn_link.name] = pn_link
-            pn_link.context = None  # @todo: update proton.py
+            pn_link.context = None  # TODO(kgiusti) update proton.py
             req_source = ""
             if pn_link.remote_source.dynamic:
                 req_source = None
@@ -250,7 +257,7 @@ Associate an arbitrary user object with this Connection.
         elif pn_link.is_receiver and pn_link.name not in self._receiver_links:
             LOG.debug("Remotely initiated Receiver needs init")
             self._receiver_links[pn_link.name] = pn_link
-            pn_link.context = None  # @todo: update proton.py
+            pn_link.context = None  # TODO(kgiusti) update proton.py
             req_target = ""
             if pn_link.remote_target.dynamic:
                 req_target = None
@@ -281,7 +288,7 @@ Associate an arbitrary user object with this Connection.
         self._next_tick = self._pn_transport.tick(now)
 
         # wait until SASL has authenticated
-        # @todo Server-side SASL
+        # TODO(kgiusti) Server-side SASL
         if self._pn_sasl:
             if self._pn_sasl.state not in (proton.SASL.STATE_PASS,
                                            proton.SASL.STATE_FAIL):
@@ -315,7 +322,7 @@ Associate an arbitrary user object with this Connection.
 
             pn_link = next_link
 
-        # @todo: won't scale?
+        # TODO(kgiusti) won't scale?
         pn_link = self._pn_connection.link_head(self._ACTIVE)
         while pn_link:
             next_link = pn_link.next(self._ACTIVE)
@@ -353,7 +360,7 @@ Associate an arbitrary user object with this Connection.
         while pn_link:
             LOG.debug("Link closed remotely")
             next_link = pn_link.next(self._REMOTE_CLOSE)
-            # @todo: error reporting
+            # TODO(kgiusti) error reporting
             if pn_link.context:
                 if pn_link.is_sender:
                     sender_link = pn_link.context
@@ -486,7 +493,7 @@ Associate an arbitrary user object with this Connection.
             self._write_done = True
 
     def create_sender(self, source_address, target_address=None,
-                      eventHandler=None, name=None, properties={}):
+                      event_handler=None, name=None, properties=None):
         """Factory method for Sender links."""
         ident = name or str(source_address)
         if ident in self._sender_links:
@@ -496,14 +503,14 @@ Associate an arbitrary user object with this Connection.
         if pn_link:
             s = SenderLink(self, pn_link,
                            source_address, target_address,
-                           eventHandler, properties)
+                           event_handler, properties)
             self._sender_links[ident] = s
             pn_link.open()
             return s
         return None
 
     def accept_sender(self, link_handle, source_override=None,
-                      event_handler=None, properties={}):
+                      event_handler=None, properties=None):
         pn_link = self._sender_links.get(link_handle)
         if not pn_link or not isinstance(pn_link, proton.Sender):
             raise Exception("Invalid link_handle: %s" % link_handle)
@@ -522,11 +529,11 @@ Associate an arbitrary user object with this Connection.
         if not pn_link or not isinstance(pn_link, proton.Sender):
             raise Exception("Invalid link_handle: %s" % link_handle)
         del self._sender_links[link_handle]
-        # @todo support reason for close
+        # TODO(kgiusti) support reason for close
         pn_link.close()
 
     def create_receiver(self, target_address, source_address=None,
-                        eventHandler=None, name=None, properties={}):
+                        event_handler=None, name=None, properties=None):
         """Factory method for creating Receive links."""
         ident = name or str(target_address)
         if ident in self._receiver_links:
@@ -535,14 +542,14 @@ Associate an arbitrary user object with this Connection.
         pn_link = self._pn_session.receiver(ident)
         if pn_link:
             r = ReceiverLink(self, pn_link, target_address,
-                             source_address, eventHandler, properties)
+                             source_address, event_handler, properties)
             self._receiver_links[ident] = r
             pn_link.open()
             return r
         return None
 
     def accept_receiver(self, link_handle, target_override=None,
-                        event_handler=None, properties={}):
+                        event_handler=None, properties=None):
         pn_link = self._receiver_links.get(link_handle)
         if not pn_link or not isinstance(pn_link, proton.Receiver):
             raise Exception("Invalid link_handle: %s" % link_handle)
@@ -561,7 +568,7 @@ Associate an arbitrary user object with this Connection.
         if not pn_link or not isinstance(pn_link, proton.Receiver):
             raise Exception("Invalid link_handle: %s" % link_handle)
         del self._receiver_links[link_handle]
-        # @todo support reason for close
+        # TODO(kgiusti) support reason for close
         pn_link.close()
 
     def _remove_sender(self, name):
@@ -584,6 +591,8 @@ Associate an arbitrary user object with this Connection.
         return self.EOS
 
     def _configure_ssl(self, properties):
+        if not properties:
+            return None
         verify_modes = {'verify-peer': proton.SSLDomain.VERIFY_PEER_NAME,
                         'verify-cert': proton.SSLDomain.VERIFY_PEER,
                         'no-verify': proton.SSLDomain.ANONYMOUS_PEER}
@@ -623,5 +632,5 @@ Associate an arbitrary user object with this Connection.
         pn_ssl = proton.SSL(self._pn_transport, domain)
         if hostname:
             pn_ssl.peer_hostname = hostname
-        LOG.debug("SSL configured for connection %s" % self._name)
+        LOG.debug("SSL configured for connection %s", self._name)
         return pn_ssl

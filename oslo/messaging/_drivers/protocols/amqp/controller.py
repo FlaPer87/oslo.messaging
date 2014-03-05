@@ -30,7 +30,7 @@ class Replies(engine.ReceiverEventHandler):
         self._ready = False
         self._on_ready = on_ready
         self._receiver = connection.create_receiver("replies",
-                                                    eventHandler=self)
+                                                    event_handler=self)
         self.capacity = 100  # somewhat arbitrary
         self._credit = 0
 
@@ -87,7 +87,7 @@ class Server(engine.ReceiverEventHandler):
         for a in self._addresses:
             r = connection.create_receiver(source_address=a,
                                            target_address=a,
-                                           eventHandler=self)
+                                           event_handler=self)
             r.add_capacity(1)  # TODO(grs)
             self._receivers.append(r)
 
