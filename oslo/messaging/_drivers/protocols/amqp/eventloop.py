@@ -95,6 +95,7 @@ class _SocketConnection():
             self.handler.connection_failed(self.connection, error)
         my_socket = socket.socket(addr[0][0], addr[0][1], addr[0][2])
         my_socket.setblocking(0)  # 0=non-blocking
+        my_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
             my_socket.connect(addr[0][4])
         except socket.error as e:

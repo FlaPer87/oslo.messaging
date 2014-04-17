@@ -194,6 +194,12 @@ class ProtonIncomingMessage(base.IncomingMessage):
         else:
             LOG.debug("Ignoring reply as no reply address available")
 
+    def acknowledge(self):
+        pass
+
+    def requeue(self):
+        pass
+
 
 class ProtonListener(base.Listener):
     def __init__(self, driver, tasks):
