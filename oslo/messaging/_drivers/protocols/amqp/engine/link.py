@@ -26,52 +26,65 @@ import collections
 import logging
 import proton
 
+from endpoint import Endpoint
+
 LOG = logging.getLogger(__name__)
 
 
-class _Link(object):
+class _Link(Endpoint):
     """A generic Link base class."""
-    def __init__(self, connection, pn_link,
-                 target_address, source_address,
-                 handler, properties):
+
+    def __init__(self, connection, pn_link):
+        super(_Link, self).__init__(pn_link.name)
         self._connection = connection
-        self._name = pn_link.name
-        self._handler = handler
-        self._properties = properties
+        self._handler = None
+        self._properties = None
         self._user_context = None
-        self._active = False
         # TODO(kgiusti): raise jira to add 'context' attr to api
         self._pn_link = pn_link
         pn_link.context = self
 
+    def configure(self, target_address, source_address, handler, properties):
+        """Assign addresses, properties, etc."""
+        self._handler = handler
+        self._properties = properties
+
         if target_address is None:
-            assert pn_link.is_sender, "Dynamic target not allowed"
+            if not self._pn_link.is_sender:
+                raise Exception("Dynamic target not allowed")
             self._pn_link.target.dynamic = True
         elif target_address:
             self._pn_link.target.address = target_address
 
         if source_address is None:
-            assert pn_link.is_receiver, "Dynamic source not allowed"
+            if not self._pn_link.is_receiver:
+                raise Exception("Dynamic source not allowed")
             self._pn_link.source.dynamic = True
         elif source_address:
             self._pn_link.source.address = source_address
 
-        desired_mode = properties.get("distribution-mode")
-        if desired_mode:
-            if desired_mode == "copy":
-                mode = proton.Terminus.DIST_MODE_COPY
-            elif desired_mode == "move":
-                mode = proton.Terminus.DIST_MODE_MOVE
-            else:
-                raise Exception("Unknown distribution mode: %s" %
-                                str(desired_mode))
-            self._pn_link.source.distribution_mode = mode
+        if properties:
+            desired_mode = properties.get("distribution-mode")
+            if desired_mode:
+                if desired_mode == "copy":
+                    mode = proton.Terminus.DIST_MODE_COPY
+                elif desired_mode == "move":
+                    mode = proton.Terminus.DIST_MODE_MOVE
+                else:
+                    raise Exception("Unknown distribution mode: %s" %
+                                    str(desired_mode))
+                self._pn_link.source.distribution_mode = mode
 
     @property
     def name(self):
         return self._name
 
+    @property
+    def connection(self):
+        return self._connection
+
     def open(self):
+        LOG.debug("Opening the link.")
         self._pn_link.open()
 
     def _get_user_context(self):
@@ -104,8 +117,17 @@ class _Link(object):
         else:
             return self._pn_link.remote_target.address
 
-    def close(self, error=None):
+    def close(self, pn_condition=None):
+        LOG.debug("Closing the link.")
+        if pn_condition:
+            self._pn_link.condition = pn_condition
         self._pn_link.close()
+
+    @property
+    def active(self):
+        state = self._pn_link.state
+        return state == (proton.Endpoint.LOCAL_ACTIVE
+                         | proton.Endpoint.REMOTE_ACTIVE)
 
     @property
     def closed(self):
@@ -113,22 +135,51 @@ class _Link(object):
         return state == (proton.Endpoint.LOCAL_CLOSED
                          | proton.Endpoint.REMOTE_CLOSED)
 
+    def reject(self, pn_condition):
+        self._pn_link.open()
+        if pn_condition:
+            self._pn_link.condition = pn_condition
+        self._pn_link.close()
+
     def destroy(self):
-        LOG.debug("link destroyed %s" % str(self._pn_link))
+        LOG.debug("link destroyed %s", str(self._pn_link))
         self._user_context = None
-        self._pn_link.context = None
-        self._pn_link = None
+        self._connection = None
+        if self._pn_link:
+            session = self._pn_link.session.context
+            self._pn_link.context = None
+            self._pn_link.free()
+            self._pn_link = None
+            session.link_destroyed(self)  # destroy session _after_ link
+
+    @property
+    def _endpoint_state(self):
+        return self._pn_link.state
+
+    def _process_delivery(self, pn_delivery):
+        raise NotImplementedError("Must Override")
+
+    def _process_credit(self):
+        raise NotImplementedError("Must Override")
+
+    def _session_closed(self):
+        """Remote has closed the session used by this link."""
+        # simulate a remote-closed event:
+        self._dispatch_event(Endpoint.REMOTE_CLOSED)
 
 
 class SenderEventHandler(object):
     def sender_active(self, sender_link):
         LOG.debug("sender_active (ignored)")
 
-    def sender_remote_closed(self, sender_link, error=None):
+    def sender_remote_closed(self, sender_link, pn_condition):
         LOG.debug("sender_remote_closed (ignored)")
 
     def sender_closed(self, sender_link):
         LOG.debug("sender_closed (ignored)")
+
+    def credit_granted(self, sender_link):
+        LOG.debug("credit_granted (ignored)")
 
 
 class SenderLink(_Link):
@@ -143,65 +194,99 @@ class SenderLink(_Link):
     RELEASED = 3
     MODIFIED = 4
 
-    def __init__(self, connection, pn_link, source_address,
-                 target_address, eventHandler, properties):
-        super(SenderLink, self).__init__(connection, pn_link,
-                                         target_address, source_address,
-                                         eventHandler, properties)
-        self._pending_sends = collections.deque()
-        self._pending_acks = {}
+    class _SendRequest(object):
+        """Tracks sending a single message."""
+        def __init__(self, link, tag, message, callback, handle, deadline):
+            self.link = link
+            self.tag = tag
+            self.message = message
+            self.callback = callback
+            self.handle = handle
+            self.deadline = deadline
+            self.link._send_requests[self.tag] = self
+            if deadline:
+                self.link._connection._add_timer(deadline, self)
+
+        def __call__(self):
+            """Invoked by Connection on timeout (now <= deadline)."""
+            self.link._send_expired(self)
+
+        def destroy(self, state, info):
+            """Invoked on final completion of send."""
+            if self.deadline and state != SenderLink.TIMED_OUT:
+                self.link._connection._cancel_timer(self.deadline, self)
+            if self.tag in self.link._send_requests:
+                del self.link._send_requests[self.tag]
+            if self.callback:
+                self.callback(self.link, self.handle, state, info)
+
+    def __init__(self, connection, pn_link):
+        super(SenderLink, self).__init__(connection, pn_link)
+        self._send_requests = {}  # indexed by tag
+        self._pending_sends = collections.deque()  # tags in order sent
         self._next_deadline = 0
         self._next_tag = 0
+        self._last_credit = 0
 
         # TODO(kgiusti) - think about send-settle-mode configuration
 
     def send(self, message, delivery_callback=None,
              handle=None, deadline=None):
-        self._pending_sends.append((message, delivery_callback, handle,
-                                   deadline))
-        # TODO(kgiusti) deadline not supported yet
-        assert not deadline, "send timeout not supported yet!"
-        if deadline and (self._next_deadline == 0 or
-                         self._next_deadline > deadline):
-            self._next_deadline = deadline
-
-        delivery = self._pn_link.delivery("tag-%x" % self._next_tag)
+        tag = "dingus-tag-%s" % self._next_tag
         self._next_tag += 1
+        send_req = SenderLink._SendRequest(self, tag, message,
+                                           delivery_callback, handle,
+                                           deadline)
+        self._pn_link.delivery(tag)
+        LOG.debug("Sending a message, tag=%s", tag)
 
-        if delivery.writable:
-            send_req = self._pending_sends.popleft()
-            self._write_msg(delivery, send_req)
+        if deadline:
+            self._connection._add_timer(deadline, send_req)
+
+        pn_delivery = self._pn_link.current
+        if pn_delivery and pn_delivery.writable:
+            # send oldest pending:
+            if self._pending_sends:
+                self._pending_sends.append(tag)
+                tag = self._pending_sends.popleft()
+                send_req = self._send_requests[tag]
+                LOG.debug("Sending previous pending message, tag=%s", tag)
+            self._write_msg(pn_delivery, send_req)
+        else:
+            LOG.debug("Send is pending for credit, tag=%s", tag)
+            self._pending_sends.append(tag)
 
         return 0
 
+    @property
     def pending(self):
-        return len(self._pending_sends) + len(self._pending_acks)
+        return len(self._send_requests)
 
+    @property
     def credit(self):
-        return self._pn_link.credit()
+        return self._pn_link.credit
 
-    def close(self, error=None):
-        while self._pending_sends:
-            i = self._pending_sends.popleft()
-            cb = i[1]
-            if cb:
-                handle = i[2]
-                cb(self, handle, self.ABORTED, error)
-        for i in self._pending_acks.itervalues():
-            cb = i[1]
-            handle = i[2]
-            cb(self, handle, self.ABORTED, error)
-        self._pending_acks.clear()
-        super(SenderLink, self).close()
+    def close(self, pn_condition=None):
+        self._pending_sends.clear()
+        info = {"condition": pn_condition} if pn_condition else None
+        while self._send_requests:
+            key, send_req = self._send_requests.popitem()
+            # TODO(kgiusti) fix - must be async!
+            send_req.destroy(SenderLink.ABORTED, info)
+        super(SenderLink, self).close(pn_condition)
+
+    def reject(self, pn_condition=None):
+        """See Link Reject, AMQP1.0 spec."""
+        self._pn_link.source.type = proton.Terminus.UNSPECIFIED
+        super(SenderLink, self).reject(pn_condition)
 
     def destroy(self):
         self._connection._remove_sender(self._name)
         self._connection = None
         super(SenderLink, self).destroy()
 
-    def _delivery_updated(self, delivery):
-        # A delivery has changed state.
-        # Do we need to know?
+    def _process_delivery(self, pn_delivery):
+        """Check if the delivery can be processed."""
         _disposition_state_map = {
             proton.Disposition.ACCEPTED: SenderLink.ACCEPTED,
             proton.Disposition.REJECTED: SenderLink.REJECTED,
@@ -209,41 +294,116 @@ class SenderLink(_Link):
             proton.Disposition.MODIFIED: SenderLink.MODIFIED,
         }
 
-        if delivery.tag in self._pending_acks:
-            if delivery.settled:  # remote has finished
-                LOG.debug("delivery updated, remote state=%s",
-                          str(delivery.remote_state))
-
-                send_req = self._pending_acks.pop(delivery.tag)
-                state = _disposition_state_map.get(delivery.remote_state,
+        LOG.debug("Processing delivery, tag=%s", str(pn_delivery.tag))
+        if pn_delivery.tag in self._send_requests:
+            if pn_delivery.settled:  # remote has finished
+                LOG.debug("Remote has settled a sent msg")
+                state = _disposition_state_map.get(pn_delivery.remote_state,
                                                    self.UNKNOWN)
-                cb = send_req[1]
-                handle = send_req[2]
-
-                cb(self, handle, state, None)
-                delivery.settle()
+                pn_disposition = pn_delivery.remote
+                info = {}
+                if state == SenderLink.REJECTED:
+                    if pn_disposition.condition:
+                        info["condition"] = pn_disposition.condition
+                elif state == SenderLink.MODIFIED:
+                    info["delivery-failed"] = pn_disposition.failed
+                    info["undeliverable-here"] = pn_disposition.undeliverable
+                    annotations = pn_disposition.annotations
+                    if annotations:
+                        info["message-annotations"] = annotations
+                send_req = self._send_requests.pop(pn_delivery.tag)
+                send_req.destroy(state, info)
+                pn_delivery.settle()
+            elif pn_delivery.writable:
+                # we can now send on this delivery
+                LOG.debug("Delivery has become writable")
+                if self._pending_sends:
+                    tag = self._pending_sends.popleft()
+                    send_req = self._send_requests[tag]
+                    self._write_msg(pn_delivery, send_req)
         else:
-            # not for a sent msg, use it to send the next
-            if delivery.writable and self._pending_sends:
-                send_req = self._pending_sends.popleft()
-                self._write_msg(delivery, send_req)
-            else:
-                # what else is there???
-                delivery.settle()
+            # tag no longer valid, expired or canceled send?
+            LOG.debug("Delivery ignored, tag=%s", str(pn_delivery.tag))
+            pn_delivery.settle()
 
-    def _write_msg(self, delivery, send_req):
+    def _process_credit(self):
+        # check if any pending deliveries are now writable:
+        pn_delivery = self._pn_link.current
+        while (self._pending_sends and
+               pn_delivery and pn_delivery.writable):
+            self._process_delivery(pn_delivery)
+            pn_delivery = self._pn_link.current
+
+        # Alert if credit has become available
+        new_credit = self._pn_link.credit
+        if self._handler:
+            if self._last_credit <= 0 and new_credit > 0:
+                LOG.debug("Credit is available, link=%s", self.name)
+                self._handler.credit_granted(self)
+        self._last_credit = new_credit
+
+    def _write_msg(self, pn_delivery, send_req):
         # given a writable delivery, send a message
-        # send_req = (msg, cb, handle, deadline)
-        msg = send_req[0]
-        cb = send_req[1]
-        self._pn_link.send(msg.encode())
+        LOG.debug("Sending message to engine, tag=%s", send_req.tag)
+        self._pn_link.send(send_req.message.encode())
         self._pn_link.advance()
-        if cb:  # delivery callback given
-            assert delivery.tag not in self._pending_acks
-            self._pending_acks[delivery.tag] = send_req
-        else:
-            # no status required, so settle it now.
-            delivery.settle()
+        self._last_credit = self._pn_link.credit
+        if not send_req.callback:
+            # no disposition callback, so we can discard the send request and
+            # settle the delivery immediately
+            send_req.destroy(SenderLink.UNKNOWN, {})
+            pn_delivery.settle()
+
+    def _send_expired(self, send_req):
+        LOG.debug("Send request timed-out, tag=%s", send_req.tag)
+        try:
+            self._pending_sends.remove(send_req.tag)
+        except ValueError:
+            pass
+        send_req.destroy(SenderLink.TIMED_OUT, None)
+
+    # endpoint state machine actions:
+
+    def _ep_active(self):
+        LOG.debug("SenderLink is up")
+        if self._handler:
+            self._handler.sender_active(self)
+
+    def _ep_need_close(self):
+        LOG.debug("SenderLink remote closed")
+        if self._handler:
+            cond = self._pn_link.remote_condition
+            self._handler.sender_remote_closed(self, cond)
+
+    def _ep_closed(self):
+        LOG.debug("SenderLink close completed")
+        if self._handler:
+            self._handler.sender_closed(self)
+
+    def _ep_requested(self):
+        LOG.debug("Remote has requested a SenderLink")
+        handler = self._connection._handler
+        if handler:
+            pn_link = self._pn_link
+            # has the remote requested a source address?
+            req_source = ""
+            if pn_link.remote_source.dynamic:
+                req_source = None
+            elif pn_link.remote_source.address:
+                req_source = pn_link.remote_source.address
+
+            props = {"target-address": pn_link.remote_target.address}
+            dist_mode = pn_link.remote_source.distribution_mode
+            if (dist_mode == proton.Terminus.DIST_MODE_COPY):
+                props["distribution-mode"] = "copy"
+            elif (dist_mode == proton.Terminus.DIST_MODE_MOVE):
+                props["distribution-mode"] = "move"
+
+            handler.sender_requested(self._connection,
+                                     pn_link.name,  # handle
+                                     pn_link.name,
+                                     req_source,
+                                     props)
 
 
 class ReceiverEventHandler(object):
@@ -251,7 +411,7 @@ class ReceiverEventHandler(object):
     def receiver_active(self, receiver_link):
         LOG.debug("receiver_active (ignored)")
 
-    def receiver_remote_closed(self, receiver_link, error=None):
+    def receiver_remote_closed(self, receiver_link, pn_condition):
         LOG.debug("receiver_remote_closed (ignored)")
 
     def receiver_closed(self, receiver_link):
@@ -262,46 +422,70 @@ class ReceiverEventHandler(object):
 
 
 class ReceiverLink(_Link):
-    def __init__(self, connection, pn_link, target_address,
-                 source_address, eventHandler, properties):
-        super(ReceiverLink, self).__init__(connection, pn_link,
-                                           target_address, source_address,
-                                           eventHandler, properties)
+    def __init__(self, connection, pn_link):
+        super(ReceiverLink, self).__init__(connection, pn_link)
         self._next_handle = 0
         self._unsettled_deliveries = {}  # indexed by handle
 
         # TODO(kgiusti) - think about receiver-settle-mode configuration
 
+    @property
     def capacity(self):
-        return self._pn_link.credit()
+        return self._pn_link.credit
 
     def add_capacity(self, amount):
         self._pn_link.flow(amount)
 
+    def _settle_delivery(self, handle, state):
+        pn_delivery = self._unsettled_deliveries.pop(handle, None)
+        if pn_delivery is None:
+            raise Exception("Invalid message handle: %s" % str(handle))
+        pn_delivery.update(state)
+        pn_delivery.settle()
+
     def message_accepted(self, handle):
         self._settle_delivery(handle, proton.Delivery.ACCEPTED)
-
-    def message_rejected(self, handle, reason=None):
-        # TODO(kgiusti): how to deal with 'reason'
-        self._settle_delivery(handle, proton.Delivery.REJECTED)
 
     def message_released(self, handle):
         self._settle_delivery(handle, proton.Delivery.RELEASED)
 
-    def message_modified(self, handle):
-        self._settle_delivery(handle, proton.Delivery.MODIFIED)
+    def message_rejected(self, handle, pn_condition=None):
+        pn_delivery = self._unsettled_deliveries.pop(handle, None)
+        if pn_delivery is None:
+            raise Exception("Invalid message handle: %s" % str(handle))
+        if pn_condition:
+            pn_delivery.local.condition = pn_condition
+        pn_delivery.update(proton.Delivery.REJECTED)
+        pn_delivery.settle()
 
-    def destroy(self, error=None):
+    def message_modified(self, handle, delivery_failed, undeliverable,
+                         annotations):
+        pn_delivery = self._unsettled_deliveries.pop(handle, None)
+        if pn_delivery is None:
+            raise Exception("Invalid message handle: %s" % str(handle))
+        pn_delivery.local.failed = delivery_failed
+        pn_delivery.local.undeliverable = undeliverable
+        if annotations:
+            pn_delivery.local.annotations = annotations
+        pn_delivery.update(proton.Delivery.MODIFIED)
+        pn_delivery.settle()
+
+    def reject(self, pn_condition=None):
+        """See Link Reject, AMQP1.0 spec."""
+        self._pn_link.target.type = proton.Terminus.UNSPECIFIED
+        super(ReceiverLink, self).reject(pn_condition)
+
+    def destroy(self):
         self._connection._remove_receiver(self._name)
         self._connection = None
         super(ReceiverLink, self).destroy()
 
-    def _delivery_updated(self, delivery):
-        # a receive delivery changed state
+    def _process_delivery(self, pn_delivery):
+        """Check if the delivery can be processed."""
         # TODO(kgiusti): multi-frame message transfer
-        LOG.debug("Receive delivery updated")
-        if delivery.readable:
-            data = self._pn_link.recv(delivery.pending)
+        if pn_delivery.readable:
+            LOG.debug("Receive delivery readable")
+            data = self._pn_link.recv(pn_delivery.pending)
             msg = proton.Message()
             msg.decode(data)
             self._pn_link.advance()
@@ -309,16 +493,132 @@ class ReceiverLink(_Link):
             if self._handler:
                 handle = "rmsg-%s:%x" % (self._name, self._next_handle)
                 self._next_handle += 1
-                self._unsettled_deliveries[handle] = delivery
+                self._unsettled_deliveries[handle] = pn_delivery
                 self._handler.message_received(self, msg, handle)
             else:
                 # TODO(kgiusti): is it ok to assume Delivery.REJECTED?
-                delivery.settle()
+                pn_delivery.settle()
 
-    def _settle_delivery(self, handle, result):
-        # settle delivery associated with a handle
-        if handle not in self._unsettled_deliveries:
-            raise Exception("Invalid message handle: %s" % str(handle))
-        delivery = self._unsettled_deliveries.pop(handle)
-        delivery.update(result)
-        delivery.settle()
+    def _process_credit(self):
+        # Only used by SenderLink
+        pass
+
+    # endpoint state machine actions:
+
+    def _ep_active(self):
+        LOG.debug("ReceiverLink is up")
+        if self._handler:
+            self._handler.receiver_active(self)
+
+    def _ep_need_close(self):
+        LOG.debug("ReceiverLink remote closed")
+        if self._handler:
+            cond = self._pn_link.remote_condition
+            self._handler.receiver_remote_closed(self, cond)
+
+    def _ep_closed(self):
+        LOG.debug("ReceiverLink close completed")
+        if self._handler:
+            self._handler.receiver_closed(self)
+
+    def _ep_requested(self):
+        LOG.debug("Remote has initiated a ReceiverLink")
+        handler = self._connection._handler
+        if handler:
+            pn_link = self._pn_link
+            # has the remote requested a target address?
+            req_target = ""
+            if pn_link.remote_target.dynamic:
+                req_target = None
+            elif pn_link.remote_target.address:
+                req_target = pn_link.remote_target.address
+
+            props = {"source-address": pn_link.remote_source.address}
+            dist_mode = pn_link.remote_source.distribution_mode
+            if (dist_mode == proton.Terminus.DIST_MODE_COPY):
+                props["distribution-mode"] = "copy"
+            elif (dist_mode == proton.Terminus.DIST_MODE_MOVE):
+                props["distribution-mode"] = "move"
+
+            handler.receiver_requested(self._connection,
+                                       pn_link.name,  # handle
+                                       pn_link.name,
+                                       req_target,
+                                       props)
+
+
+class _SessionProxy(Endpoint):
+    """Corresponds to a Proton Session object."""
+    def __init__(self, name, connection, pn_session=None):
+        super(_SessionProxy, self).__init__(name)
+        self._locally_initiated = not pn_session
+        self._connection = connection
+        if not pn_session:
+            pn_session = connection._pn_connection.session()
+        self._pn_session = pn_session
+        self._links = set()
+        pn_session.context = self
+
+    def open(self):
+        self._pn_session.open()
+
+    def new_sender(self, name):
+        """Create a new sender link."""
+        pn_link = self._pn_session.sender(name)
+        return self.request_sender(pn_link)
+
+    def request_sender(self, pn_link):
+        """Create link from request for a sender."""
+        sl = SenderLink(self._connection, pn_link)
+        self._links.add(sl)
+        return sl
+
+    def new_receiver(self, name):
+        """Create a new receiver link."""
+        pn_link = self._pn_session.receiver(name)
+        return self.request_receiver(pn_link)
+
+    def request_receiver(self, pn_link):
+        """Create link from request for a receiver."""
+        rl = ReceiverLink(self._connection, pn_link)
+        self._links.add(rl)
+        return rl
+
+    def link_destroyed(self, link):
+        """Link has been destroyed."""
+        self._links.discard(link)
+        if not self._links:
+            # no more links
+            LOG.debug("destroying unneeded session")
+            self._pn_session.close()
+            self._pn_session.free()
+            self._pn_session = None
+            self._connection = None
+
+    @property
+    def _endpoint_state(self):
+        return self._pn_session.state
+
+    # endpoint state machine actions:
+
+    def _ep_requested(self):
+        """Peer has requested a new session."""
+        LOG.debug("Session %s requested - opening...",
+                  self._name)
+        self.open()
+
+    def _ep_active(self):
+        """Both ends of the Endpoint have become active."""
+        LOG.debug("Session %s active", self._name)
+
+    def _ep_need_close(self):
+        """Peer has closed its end of the session."""
+        LOG.debug("Session %s close requested - closing...",
+                  self._name)
+        links = self._links.copy()  # may modify _links
+        for link in links:
+            link._session_closed()
+
+    def _ep_closed(self):
+        """Both ends of the endpoint have closed."""
+        LOG.debug("Session %s closed", self._name)

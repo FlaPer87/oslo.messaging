@@ -106,7 +106,7 @@ class _SocketConnection():
         self.socket = my_socket
 
         if sasl_mechanisms:
-            pn_sasl = self.connection.sasl
+            pn_sasl = self.connection.pn_sasl
             pn_sasl.mechanisms(sasl_mechanisms)
             # TODO(kgiusti): server if accepting inbound connections
             pn_sasl.client()
@@ -243,7 +243,7 @@ class Thread(threading.Thread):
 
             timeout = None
             if timers:
-                deadline = timers[0].next_tick  # 0 == next expiring timer
+                deadline = timers[0].deadline  # 0 == next expiring timer
                 now = time.time()
                 timeout = 0 if deadline <= now else deadline - now
 
@@ -257,7 +257,7 @@ class Thread(threading.Thread):
 
             self._schedule.process()
             for t in timers:
-                if t.next_tick > time.time():
+                if t.deadline > time.time():
                     break
                 t.process(time.time())
 

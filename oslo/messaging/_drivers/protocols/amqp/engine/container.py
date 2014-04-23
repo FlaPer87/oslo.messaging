@@ -15,7 +15,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 __all__ = [
-    "ContainerEventHandler",
     "Container"
 ]
 
@@ -27,29 +26,28 @@ from connection import Connection
 LOG = logging.getLogger(__name__)
 
 
-class ContainerEventHandler(object):
-    # TODO(kgiusti) - ContainerEventHandler
-    pass
-
-
 class Container(object):
     """An implementation of an AMQP 1.0 container."""
-    def __init__(self, name, eventHandler=None, properties={}):
+    def __init__(self, name, properties=None):
         self._name = name
         self._connections = {}
         self._timer_heap = []  # (next_tick, connection)
         self._need_processing = set()
-        self._handler = eventHandler
         self._properties = properties
+
+    def destroy(self):
+        conns = self._connections.values()
+        for conn in conns:
+            conn.destroy()
 
     @property
     def name(self):
         return self._name
 
-    def create_connection(self, name, eventHandler=None, properties={}):
+    def create_connection(self, name, event_handler=None, properties=None):
         if name in self._connections:
             raise KeyError("connection '%s' already exists" % str(name))
-        conn = Connection(self, name, eventHandler, properties)
+        conn = Connection(self, name, event_handler, properties)
         if conn:
             self._connections[name] = conn
         return conn
@@ -88,8 +86,5 @@ class Container(object):
         return self._connections.get(name, None)
 
     def remove_connection(self, name):
-        self._remove_connection(name)
-
-    def _remove_connection(self, name):
         if name in self._connections:
             del self._connections[name]

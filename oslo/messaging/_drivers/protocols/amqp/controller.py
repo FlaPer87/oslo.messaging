@@ -30,9 +30,11 @@ class Replies(engine.ReceiverEventHandler):
         self._ready = False
         self._on_ready = on_ready
         self._receiver = connection.create_receiver("replies",
-                                                    eventHandler=self)
+                                                    event_handler=self,
+                                                    name=uuid.uuid4().hex)
         self.capacity = 100  # somewhat arbitrary
         self._credit = 0
+        self._receiver.open()
 
     def ready(self):
         return self._ready
@@ -51,10 +53,10 @@ class Replies(engine.ReceiverEventHandler):
         self._on_ready()
         LOG.debug("Replies expected on %s" % self._receiver.source_address)
 
-    def receiver_remote_closed(self, receiver, error=None):
+    def receiver_remote_closed(self, receiver, pn_condition):
         # TODO(grs)
         LOG.error("Reply subscription closed by peer: %s",
-                  (error or "no error given"))
+                  (pn_condition or "no error given"))
 
     def message_received(self, receiver, message, handle):
         self._credit = self._credit - 1
@@ -87,15 +89,17 @@ class Server(engine.ReceiverEventHandler):
         for a in self._addresses:
             r = connection.create_receiver(source_address=a,
                                            target_address=a,
-                                           eventHandler=self)
+                                           event_handler=self,
+                                           name=uuid.uuid4().hex)
             r.add_capacity(1)  # TODO(grs)
+            r.open()
             self._receivers.append(r)
 
-    def receiver_remote_closed(self, receiver, error=None):
+    def receiver_remote_closed(self, receiver, pn_condition):
         text = "Server subscription %(addr)s closed by peer: %(err_msg)s"
         vals = {
             "addr": receiver.source_address or receiver.target_address,
-            "err_msg": error or "no error given"
+            "err_msg": pn_condition or "no error given"
         }
         LOG.error(text % vals)
 
@@ -330,7 +334,9 @@ class Controller(engine.ConnectionEventHandler):
             sender = self._senders[address]
         else:
             sender = self._connection.create_sender(source_address=address,
-                                                    target_address=address)
+                                                    target_address=address,
+                                                    name=uuid.uuid4().hex)
+            sender.open()
             self._senders[address] = sender
         return sender
 
