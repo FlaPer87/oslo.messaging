@@ -254,7 +254,7 @@ class ProtonDriver(base.BaseDriver):
         self._ensure_connected()
         request = marshal_request(message, ctxt, envelope)
         if timeout:
-            request.ttl = timeout
+            request.ttl = timeout*1000  # ttl is in milliseconds
         task = SendTask(target, request, wait_for_reply)
         self._mgr.tasks().put(task)
         if wait_for_reply:
