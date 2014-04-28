@@ -19,6 +19,7 @@ import logging
 import os
 import select
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -41,8 +42,12 @@ class _SocketConnection():
         self._handler = handler
         self._container = container
         c = container.create_connection(name, handler, properties)
+        c.pn_connection.properties = self._get_name_and_pid()
         c.user_context = self
         self.connection = c
+
+    def _get_name_and_pid(self):
+        return {u'process': os.path.basename(sys.argv[0]), u'pid': os.getpid()}
 
     def fileno(self):
         """Allows use of a _SocketConnection in a select() call.
