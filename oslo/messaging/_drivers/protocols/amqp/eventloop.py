@@ -118,7 +118,9 @@ class _SocketConnection():
         self.connection.open()
 
     def reset(self, name=None):
-        self._container.remove_connection(self.name)
+        #self._container.remove_connection(self.name)
+        if self.connection:
+            self.connection.destroy()
         if name:
             self.name = name
         c = self._container.create_connection(self.name, self._handler,
@@ -271,5 +273,4 @@ class Thread(threading.Thread):
 
         LOG.debug("Stopping Proton thread, container=%s",
                   self._container.name)
-        # abort any requests. Setting the lists to None here prevents further
-        # requests from being created
+        self._container.destroy()
